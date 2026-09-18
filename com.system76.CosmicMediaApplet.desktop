@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=Media
+Comment=Universal media controls via MPRIS2
+Type=Application
+Exec=cosmic-media-applet
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Media;MPRIS;Player;
+Icon=multimedia-player-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-CosmicHoverPopup=End
+X-OverflowPriority=10

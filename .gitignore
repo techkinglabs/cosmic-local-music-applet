@@ -1,0 +1,27 @@
+# Rust build
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# COSMIC / Just
+/result
+/result-*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+
+# Logs
+*.log
+
+# Backup desktop files
+*.desktop.bak

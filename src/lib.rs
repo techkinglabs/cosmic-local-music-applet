@@ -1,0 +1,19 @@
+//! COSMIC local music applet for universal media controls via MPRIS2.
+//!
+//! Provides a panel applet that controls media playback through D-Bus
+//! (MPRIS2 protocol) without requiring local playback capability.
+
+pub use self::message::AppMessage;
+pub use self::mpris::{
+    MediaEvent, MediaSource, MprisAdapter, PlaybackState, TrackInfo,
+};
+pub use self::manager::MediaSourceManager;
+
+/// Media source trait for controlling playback.
+pub mod error;
+/// MPRIS media source manager for discovery and control.
+pub mod manager;
+/// MPRIS adapter for D-Bus communication.
+pub mod mpris;
+/// Application message types.
+pub mod message;
