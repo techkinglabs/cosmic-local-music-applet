@@ -302,6 +302,17 @@ uninstall_applet() {
     log_ok "Uninstall complete"
 }
 
+restart_applet() {
+    log_step "Restarting applet..."
+    if pgrep -x "cosmic-media-applet" &>/dev/null; then
+        pkill -x "cosmic-media-applet" 2>/dev/null || true
+        sleep 1
+        log_ok "Applet process killed; panel will auto-restart it"
+    else
+        log_info "Applet not running (will start on next panel refresh)"
+    fi
+}
+
 main() {
     if [[ "${UNINSTALL_MODE}" == true ]]; then
         uninstall_applet
@@ -326,10 +337,11 @@ main() {
         echo -e "  ${BOLD}Symlink:${RESET}    ${SYSTEM_BIN_DIR}/${BIN_NAME}"
     fi
     echo ""
+    restart_applet
+    echo ""
     echo -e "  ${YELLOW}Next steps:${RESET}"
-    echo "  1. Log out and log back in (or restart COSMIC shell)"
-    echo "  2. Add the applet via Settings -> Desktop -> Panel -> Applets"
-    echo "  3. Select 'Media' from the available applets"
+    echo "  1. Add the applet via Settings -> Desktop -> Panel -> Applets"
+    echo "  2. Select 'Media' from the available applets"
     echo ""
 }
 

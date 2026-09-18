@@ -7,8 +7,8 @@ A lightweight COSMIC desktop applet that provides universal media controls. It d
 Core principle: On Linux, the browser IS the player. No browser extension is needed for v0.1.
 
 **Requirements**
-1. Integrate with COSMIC applet system (Rust, libcosmic)
-2. Panel UI: Previous / Play-Pause / Next buttons + track title label
+1. Integrate with COSMIC applet system (Rust, libcosmic git)
+2. Panel UI: Previous / Play-Pause / Next button (icon_button) + track title label
 3. Auto-detect active media source
 4. Controls must work across all sources (route command to active source)
 5. No local file playback in this version
@@ -20,7 +20,8 @@ Core principle: On Linux, the browser IS the player. No browser extension is nee
 │ COSMIC Shell │
 │ ┌─────────────────────────────────────────────────┐ │
 │ │ Media Applet (UI Layer) │ │
-│ │ - Panel widget: [<<] [▶/⏸] [>>] [ Title... ] │ │
+│ │ - Panel widget: [icon] (clicks to toggle popup) │ │
+│ │ - Popup: [<<] [▶/⏸] [>>] [ Title... ] │ │
 │ │ - State: Option<TrackInfo>, PlaybackState │ │
 │ │ - Subscribes to MediaSourceManager events │ │
 │ └──────────────────┬──────────────────────────────┘ │
@@ -28,39 +29,44 @@ Core principle: On Linux, the browser IS the player. No browser extension is nee
 │ ┌──────────────────▼──────────────────────────────┐ │
 │ │ MediaSourceManager │ │
 │ │ - Discovers MPRIS players via D-Bus │ │
-│ │ - Selects active source (last-playing wins) │ │
+│ │ - select_active() on startup + reselect on events │ │
 │ │ - Routes UI commands to active source │ │
 │ │ - Broadcasts MediaEvent to UI │ │
+│ │ - Forwards per-adapter subscriptions │ │
 │ └──────────────────┬──────────────────────────────┘ │
 │ │ │
 │ ┌──────────────────▼──────────────────────────────┐ │
-│ │ MprisAdapter (Single adapter for v0.1) │ │
-│ │ - Uses mpris crate / zbus │ │
+│ │ MprisAdapter (Per-source adapter) │ │
+│ │ - Uses zbus directly (no mpris crate) │ │
 │ │ - Wraps org.mpris.MediaPlayer2.* on D-Bus │ │
 │ │ - Listens to PropertiesChanged signals │ │
+│ │ - broadcast::channel for events │ │
 │ │ Covers: Brave, YouTube-in-Brave, │ │
 │ │ Jellyfin-in-Brave, VLC, Spotify, etc. │ │
-│ └─────────────────────────────────────────────────┘ │
+│ └─────────────────────────────────────────────────┘
 └─────────────────────────────────────────────────────┘
 ```
 
 **Component Breakdown**
 
 **1. COSMIC Applet (UI Layer)**
-* Built from `cosmic-applet-template`
-* Layout: horizontal `Row` in panel.
-* Elements:
+* Built from cosmic-applet-template pattern
+* Layout: `icon_button` in panel. Icon click toggles popup.
+* Popup (rendered via `view_window`):
   * `previous_btn`, `play_pause_btn`, `next_btn` (cosmic::widget::button)
-  * `title_label` (scrolling text, max 30 chars, tooltip with full title)
-* Logic: UI is dumb. It only renders state from Manager and sends `Message::Prev/PlayPause/Next`.
+  * `title_widget` (text, max 30 chars display, full title stored separately)
+* State cached in struct: `current_track`, `play_icon`, `current_track_info`, `current_state`
+* Logic: UI is dumb. It renders state from Manager and sends `Message::Prev/PlayPause/Next` / `TogglePopup`.
 
 **2. Media Source Manager**
 * Owns: `Vec<Arc<dyn MediaSource>>`
 * Responsibilities:
-  * `scan()`: call `PlayerFinder::find_all()` every 3s + on D-Bus NameOwnerChanged
-  * `select_active()`: priority rule: 1) Any `Playing` -> most recent `Playing` 2) else most recent `Paused` 3) else None
+  * `scan()`: call `ListNames` via D-Bus every rescan + on `NameOwnerChanged` signal
+  * `do_scan`: creates adapters, evaluates cached states, selects active, forwards subscriptions
+  * `reselect_active()`: re-evaluates which source is active based on cached states; called on `StateChanged` events from any adapter
   * `route(cmd)`: forwards command to `active_source`
-  * Event bus: `tokio::sync::broadcast` channel for `MediaEvent::TrackChanged | StateChanged | SourceChanged`
+  * Event bus: `tokio::sync::broadcast` channel for `MediaEvent::TrackChanged | StateChanged | SourceListChanged`
+  * Per-adapter subscription forwarding: each adapter's `subscribe()` receiver is forwarded to the manager's event channel
 
 **3. Source Adapter - MprisAdapter**
 
@@ -74,7 +80,7 @@ pub struct TrackInfo {
     pub title: String,
     pub artist: String,
     pub album: Option<String>,
-    pub source_id: String, // e.g. "chrome.instance123"
+    pub source_id: String, // e.g., "chrome.instance123"
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,31 +110,37 @@ pub trait MediaSource: Send + Sync {
 ```
 
 Implementation notes for `MprisAdapter`:
-* Wrap `mpris::Player`
-* `get_track()`: map `player.get_metadata()` -> `TrackInfo`
-* `subscribe()`: use `zbus` to watch `org.freedesktop.DBus.Properties.PropertiesChanged` on `org.mpris.MediaPlayer2.Player`
+* Direct `zbus` Proxy creation for D-Bus calls (no mpris crate)
+* `get_track()`: reads `Metadata` property via Proxy -> `TrackInfo`
+* `subscribe()`: returns receiver of adapter's internal broadcast channel
+* Internal watch task: listens to `PropertiesChanged` signal, updates cached state/track, emits events
 * No polling loop. Event-driven via D-Bus.
 
 **Data Flow**
 
 1. Applet starts -> Manager starts `scan()` task
 2. D-Bus detects `org.mpris.MediaPlayer2.chrome.instance_...` (YouTube in Brave)
-3. Manager creates `MprisAdapter` for it, subscribes to its events
-4. Adapter emits `TrackChanged` -> Manager emits to UI -> title label updates
-5. User clicks Next -> UI sends `Message::Next` -> Manager calls `active.next().await` -> D-Bus call `org.mpris.MediaPlayer2.Player.Next` -> Brave skips video
-6. Brave emits `PropertiesChanged` -> loop restarts
+3. Manager creates `MprisAdapter` for it
+4. Adapter's internal watch task listens to `PropertiesChanged` and emits `TrackChanged`/`StateChanged`
+5. Manager's forwarding task relays adapter events to UI via manager's broadcast channel
+6. `StateChanged` events trigger `reselect_active()` to re-evaluate active source
+7. Adapter emits `TrackChanged` -> Manager emits to UI -> title label updates
+8. User clicks Next -> UI sends `Message::Next` -> Manager calls `active.next().await` -> D-Bus call `org.mpris.MediaPlayer2.Player.Next` -> Brave skips video
+9. Brave emits `PropertiesChanged` -> adapter watch task updates cache -> emits event -> forward to UI
 
 **Dependencies (Rust)**
 
 ```toml
 [dependencies]
-libcosmic = "0.4"
-cosmic = { version = "0.4", features = ["applet"] }
-mpris = "2.0"
-zbus = "4"
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", features = ["applet", "tokio", "winit", "wayland"] }
+zbus = "5.19"
+zvariant = "5"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 anyhow = "1.0"
+tracing = "0.1"
+thiserror = "1.0"
+futures = "0.3"
 ```
 
 No `reqwest`, no `tokio-tungstenite`, no WebSocket for v0.1.
@@ -137,8 +149,9 @@ No `reqwest`, no `tokio-tungstenite`, no WebSocket for v0.1.
 
 ```bash
 cargo build --release
-just install
-# add in: Settings -> Desktop -> Panel -> Applets -> Media Capture
+cp target/release/cosmic-media-applet ~/.local/bin/
+cp com.system76.CosmicMediaApplet.desktop ~/.local/share/cosmic/applets/
+pkill cosmic-panel
 ```
 
 **Future Enhancements (v0.2+)**
