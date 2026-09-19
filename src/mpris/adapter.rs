@@ -2,6 +2,7 @@ use super::{MediaEvent, MediaSource, PlaybackState, TrackInfo};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+use zbus::fdo::PropertiesProxy;
 use zbus::{Connection, Proxy};
 use zvariant::Value;
 
@@ -51,38 +52,44 @@ impl MprisAdapter {
         let bus_name_clone = bus_name.clone();
 
         let _watch_handle = tokio::spawn(async move {
-            let Ok(proxy) = Proxy::new(
+            let props_proxy = match PropertiesProxy::new(
                 &conn_clone,
                 bus_name_clone.as_str(),
                 MPRIS_PATH,
-                MPRIS_INTERFACE,
             )
             .await
-            else {
-                tracing::warn!(bus_name = %bus_name_clone, "Failed to create MPRIS signal proxy");
-                return;
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(bus_name = %bus_name_clone, error = %e, "Failed to create PropertiesProxy");
+                    return;
+                }
             };
-            let Ok(mut stream) = proxy.receive_signal("PropertiesChanged").await else {
-                tracing::warn!(bus_name = %bus_name_clone, "Failed to subscribe to PropertiesChanged");
-                return;
+            let mut stream = match props_proxy.receive_properties_changed().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(bus_name = %bus_name_clone, error = %e, "Failed to subscribe to PropertiesChanged");
+                    return;
+                }
             };
             tracing::info!(bus_name = %bus_name_clone, "Watching MPRIS PropertiesChanged signals");
             while let Some(signal) = futures::StreamExt::next(&mut stream).await {
-                let body = signal.body();
-                let args: (String, HashMap<String, Value<'_>>, Vec<String>) = match body
-                    .deserialize()
-                {
+                let args = match signal.args() {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::warn!(bus_name = %bus_name_clone, error = %e, "Failed to parse PropertiesChanged signal");
+                        tracing::warn!(bus_name = %bus_name_clone, error = %e, "Failed to parse PropertiesChanged signal args");
                         continue;
                     }
                 };
-                let (iface, changed, _) = args;
-                if iface != MPRIS_INTERFACE {
+                let iface = args.interface_name();
+                if iface.as_str() != MPRIS_INTERFACE {
                     continue;
                 }
+                let changed = args.changed_properties();
                 tracing::debug!(bus_name = %bus_name_clone, changed = ?changed.keys().collect::<Vec<_>>(), "MPRIS properties changed");
+                for key in changed.keys() {
+                    tracing::debug!(bus_name = %bus_name_clone, key = ?key, "Property key");
+                }
                 if let Some(v) = changed.get("PlaybackStatus") {
                     if let Some(s) = Self::extract_string(v) {
                         let ps = match s.as_str() {
@@ -95,6 +102,7 @@ impl MprisAdapter {
                     }
                 }
                 if let Some(v) = changed.get("Metadata") {
+                    tracing::debug!(bus_name = %bus_name_clone, v = ?v, "Metadata value type");
                     if let Value::Dict(dict) = v {
                         let mut map = HashMap::new();
                         for (k, vv) in dict.iter() {

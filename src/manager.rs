@@ -136,8 +136,8 @@ impl MediaSourceManager {
         active_lock: &Arc<RwLock<Option<Arc<dyn MediaSource>>>>,
         sender: &broadcast::Sender<MediaEvent>,
         watch_handles: &Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
-        cached_track: &RwLock<Option<TrackInfo>>,
-        cached_state: &RwLock<PlaybackState>,
+        cached_track: &Arc<RwLock<Option<TrackInfo>>>,
+        cached_state: &Arc<RwLock<PlaybackState>>,
     ) {
         tracing::debug!("Scanning session D-Bus for MPRIS players");
         let names = Self::list_mpris_names_static(conn).await;
@@ -204,9 +204,45 @@ impl MediaSourceManager {
         let sources: Vec<Arc<dyn MediaSource>> = sources_lock.read().await.clone();
         for src in sources.iter().cloned() {
             let sender_clone = sender.clone();
+            let src_id = src.id().to_string();
+            let cached_track_fwd = cached_track.clone();
+            let cached_state_fwd = cached_state.clone();
+            let active_fwd = active_lock.clone();
+            let sources_fwd = sources_lock.clone();
+            let sender_for_task = sender.clone();
             let handle = tokio::spawn(async move {
                 let mut rx = src.subscribe();
                 while let Ok(event) = rx.recv().await {
+                    match &event {
+                        MediaEvent::StateChanged(state) => {
+                            *cached_state_fwd.write().await = state.clone();
+                            let current_active = active_fwd.read().await.clone();
+                            let active_id = current_active.as_ref().map(|s| s.id());
+                            if active_id.is_none() || active_id == Some(src_id.as_str()) {
+                                *active_fwd.write().await = Some(src.clone());
+                            }
+                            Self::reselect_active_inner(
+                                &sources_fwd,
+                                &active_fwd,
+                                &cached_state_fwd,
+                                &cached_track_fwd,
+                                sender_for_task.clone(),
+                            )
+                            .await;
+                        }
+                        MediaEvent::TrackChanged(track) => {
+                            *cached_track_fwd.write().await = Some(track.clone());
+                            Self::reselect_active_inner(
+                                &sources_fwd,
+                                &active_fwd,
+                                &cached_state_fwd,
+                                &cached_track_fwd,
+                                sender_for_task.clone(),
+                            )
+                            .await;
+                        }
+                        MediaEvent::SourceListChanged => {}
+                    }
                     let _ = sender_clone.send(event);
                 }
             });
@@ -264,9 +300,14 @@ impl MediaSourceManager {
         }
     }
 
-    pub async fn reselect_active(&self) {
-        tracing::debug!("Re-evaluating active MPRIS source");
-        let sources = self.sources.read().await.clone();
+    async fn reselect_active_inner(
+        sources_lock: &Arc<RwLock<Vec<Arc<dyn MediaSource>>>>,
+        active_lock: &Arc<RwLock<Option<Arc<dyn MediaSource>>>>,
+        cached_state: &Arc<RwLock<PlaybackState>>,
+        cached_track: &Arc<RwLock<Option<TrackInfo>>>,
+        sender: broadcast::Sender<MediaEvent>,
+    ) {
+        let sources = sources_lock.read().await.clone();
         let mut playing_idx: Option<usize> = None;
         let mut paused_idx: Option<usize> = None;
 
@@ -285,24 +326,38 @@ impl MediaSourceManager {
         let new_active = playing_idx
             .or(paused_idx)
             .and_then(|idx| sources.get(idx).cloned());
-        let current_active = self.active_source.read().await.clone();
+        let current_active = active_lock.read().await.clone();
 
         let new_active_id = new_active.as_ref().map(|s| s.id());
         let current_active_id = current_active.as_ref().map(|s| s.id());
         tracing::debug!(current = ?current_active_id, candidate = ?new_active_id, "Active source comparison");
 
         if new_active_id != current_active_id {
-            *self.active_source.write().await = new_active.clone();
+            *active_lock.write().await = new_active.clone();
             tracing::info!(source = ?new_active.as_ref().map(|source| source.display_name()), "Active MPRIS source changed");
             if let Some(src) = new_active {
                 let state = src.get_state().await;
-                let _ = self.event_sender.send(MediaEvent::StateChanged(state));
+                *cached_state.write().await = state.clone();
+                let _ = sender.send(MediaEvent::StateChanged(state));
                 let track = src.get_track().await;
                 if let Some(t) = track {
-                    let _ = self.event_sender.send(MediaEvent::TrackChanged(t));
+                    *cached_track.write().await = Some(t.clone());
+                    let _ = sender.send(MediaEvent::TrackChanged(t));
                 }
             }
         }
+    }
+
+    pub async fn reselect_active(&self) {
+        tracing::debug!("Re-evaluating active MPRIS source");
+        Self::reselect_active_inner(
+            &self.sources,
+            &self.active_source,
+            &self.cached_state,
+            &self.cached_track,
+            self.event_sender.clone(),
+        )
+        .await;
     }
 
     pub async fn route(&self, cmd: AppMessage) -> anyhow::Result<()> {

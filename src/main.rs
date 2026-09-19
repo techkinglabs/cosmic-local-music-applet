@@ -10,13 +10,10 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
-const MAX_TITLE_LENGTH: usize = 30;
-
 pub struct MediaApplet {
     core: cosmic::Core,
     manager: Option<Arc<MediaSourceManager>>,
     current_track: String,
-    play_icon: &'static str,
     current_track_info: Option<TrackInfo>,
     current_state: PlaybackState,
 }
@@ -40,12 +37,13 @@ impl MediaApplet {
         self.current_state = state.clone();
         if let Some(t) = track {
             let title = t.to_string();
-            let display = if title.chars().count() > MAX_TITLE_LENGTH {
+            let max_len = self.max_title_length();
+            let display = if title.chars().count() > max_len {
                 title
                     .chars()
-                    .take(MAX_TITLE_LENGTH)
+                    .take(max_len)
                     .collect::<String>()
-                    + "..."
+                + "..."
             } else {
                 title
             };
@@ -54,12 +52,31 @@ impl MediaApplet {
         } else {
             self.current_track = "No media".to_string();
         }
-        self.play_icon = match state {
-            PlaybackState::Playing => "⏸",
-            PlaybackState::Paused => "▶",
-            PlaybackState::Stopped => "▶",
+        tracing::debug!(state = ?self.current_state, "Updated playback display");
+    }
+
+    fn max_title_length(&self) -> usize {
+        let bounds = self.core.applet.suggested_bounds;
+        let max_len = match bounds {
+            Some(b) => {
+                let icon_w = self.core.applet.suggested_size(true).0 as f32;
+                let padding = self.core.applet.suggested_padding(true).0 as f32;
+                let button_count = 3.0;
+                let spacing = 6.0;
+                let used = (icon_w + padding * 2.0) * button_count + spacing * (button_count - 1.0);
+                let available = b.width - used;
+                if available <= 0.0 {
+                    0
+                } else {
+                    let avg_char_w = 7.0_f32;
+                    let len = (available / avg_char_w).floor() as usize;
+                    len.min(40)
+                }
+            }
+            None => 30,
         };
-        tracing::debug!(state = ?self.current_state, icon = %self.play_icon, "Updated playback display");
+        tracing::debug!(bounds = ?bounds, max_len, "Computed max_title_length");
+        max_len
     }
 }
 
@@ -126,7 +143,6 @@ impl cosmic::Application for MediaApplet {
                 core,
                 manager: None,
                  current_track: "No media".to_string(),
-                 play_icon: "▶",
                  current_track_info: None,
                  current_state: PlaybackState::Stopped,
             },
@@ -251,27 +267,45 @@ impl cosmic::Application for MediaApplet {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let previous_btn = cosmic::widget::button::text("⏮")
-            .on_press(Message::Previous)
-            .padding(4);
-        let play_pause_btn = cosmic::widget::button::text(self.play_icon)
-            .on_press(Message::PlayPause)
-            .padding(4);
-        let next_btn = cosmic::widget::button::text("⏭")
-            .on_press(Message::Next)
-            .padding(4);
-        let title_widget = cosmic::widget::text(&self.current_track)
-            .size(14)
-            .width(Length::FillPortion(1));
+        let play_icon = match self.current_state {
+            PlaybackState::Playing => "⏸",
+            PlaybackState::Paused | PlaybackState::Stopped => "▶",
+        };
+        let previous_btn = self.core.applet.text_button(
+            cosmic::widget::text("⏮").size(14),
+            Message::Previous,
+        );
+        let play_pause_btn = self.core.applet.text_button(
+            cosmic::widget::text(play_icon).size(14),
+            Message::PlayPause,
+        );
+        let next_btn = self.core.applet.text_button(
+            cosmic::widget::text("⏭").size(14),
+            Message::Next,
+        );
 
-        cosmic::widget::Row::new()
+        let max_len = self.max_title_length();
+        let title_widget = if max_len > 0 {
+            let title: String = self.current_track.chars().take(max_len).collect();
+            Some(
+                cosmic::widget::text(title)
+                    .size(14)
+                    .width(Length::FillPortion(1)),
+            )
+        } else {
+            None
+        };
+
+        let mut row = cosmic::widget::Row::new()
             .push(previous_btn)
             .push(play_pause_btn)
             .push(next_btn)
-            .push(title_widget)
             .spacing(6)
-            .padding([4, 8])
-        .into()
+            .padding([4, 8]);
+        if let Some(tw) = title_widget {
+            row = row.push(tw);
+        }
+        row.into()
     }
 
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
@@ -291,24 +325,31 @@ impl cosmic::Application for MediaApplet {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("cosmic_media_applet=info"));
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/techking/cosmic-media-applet.log");
-    match log_file {
-        Ok(file) => {
+    let log_path = std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{h}/.local/state/cosmic-media-applet.log"));
+    let file_result = log_path
+        .as_ref()
+        .and_then(|p| {
+            if let Some(parent) = std::path::Path::new(p).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+        });
+    match file_result {
+        Some(file) => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(file)
                 .with_target(false)
                 .try_init();
         }
-        Err(e) => {
+        None => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
                 .try_init();
-            eprintln!("Failed to open log file: {e}");
+            eprintln!("Falling back to stdout/stderr logging (catch via journalctl --user)");
         }
     }
 }

@@ -20,8 +20,8 @@ Core principle: On Linux, the browser IS the player. No browser extension is nee
 │ COSMIC Shell │
 │ ┌─────────────────────────────────────────────────┐ │
 │ │ Media Applet (UI Layer) │ │
-│ │ - Panel widget: [icon] (clicks to toggle popup) │ │
-│ │ - Popup: [<<] [▶/⏸] [>>] [ Title... ] │ │
+│ │ - Panel widget: [<<] [▶/⏸] [>>] [ Title... ] (symbolic icons, no popup) │ │
+│ │ - Dynamic title length via suggested_bounds │ │
 │ │ - State: Option<TrackInfo>, PlaybackState │ │
 │ │ - Subscribes to MediaSourceManager events │ │
 │ └──────────────────┬──────────────────────────────┘ │
@@ -51,12 +51,11 @@ Core principle: On Linux, the browser IS the player. No browser extension is nee
 
 **1. COSMIC Applet (UI Layer)**
 * Built from cosmic-applet-template pattern
-* Layout: `icon_button` in panel. Icon click toggles popup.
-* Popup (rendered via `view_window`):
-  * `previous_btn`, `play_pause_btn`, `next_btn` (cosmic::widget::button)
-  * `title_widget` (text, max 30 chars display, full title stored separately)
-* State cached in struct: `current_track`, `play_icon`, `current_track_info`, `current_state`
-* Logic: UI is dumb. It renders state from Manager and sends `Message::Prev/PlayPause/Next` / `TogglePopup`.
+* Layout: `icon_button` with symbolic icons in panel (no popup window)
+  * `media-skip-backward-symbolic`, `media-playback-pause-symbolic` / `media-playback-start-symbolic`, `media-skip-forward-symbolic`
+  * Title text widget shown/hidden dynamically based on `self.core.applet.suggested_bounds`
+* State cached in struct: `current_track`, `current_track_info`, `current_state`
+* Logic: UI is dumb. It renders state from Manager and sends `Message::Prev/PlayPause/Next`.
 
 **2. Media Source Manager**
 * Owns: `Vec<Arc<dyn MediaSource>>`
@@ -113,7 +112,7 @@ Implementation notes for `MprisAdapter`:
 * Direct `zbus` Proxy creation for D-Bus calls (no mpris crate)
 * `get_track()`: reads `Metadata` property via Proxy -> `TrackInfo`
 * `subscribe()`: returns receiver of adapter's internal broadcast channel
-* Internal watch task: listens to `PropertiesChanged` signal, updates cached state/track, emits events
+* Internal watch task: uses `zbus::fdo::PropertiesProxy` + `receive_properties_changed()` to listen to `PropertiesChanged` signals (belonging to `org.freedesktop.DBus.Properties`, not the MPRIS Player interface), updates cached state/track, emits events
 * No polling loop. Event-driven via D-Bus.
 
 **Data Flow**
@@ -121,10 +120,10 @@ Implementation notes for `MprisAdapter`:
 1. Applet starts -> Manager starts `scan()` task
 2. D-Bus detects `org.mpris.MediaPlayer2.chrome.instance_...` (YouTube in Brave)
 3. Manager creates `MprisAdapter` for it
-4. Adapter's internal watch task listens to `PropertiesChanged` and emits `TrackChanged`/`StateChanged`
-5. Manager's forwarding task relays adapter events to UI via manager's broadcast channel
+4. Adapter's internal watch task uses `PropertiesProxy::receive_properties_changed()` to listen to `PropertiesChanged` signals and emits `TrackChanged`/`StateChanged`
+5. Manager's forwarding task relays adapter events to UI via manager's broadcast channel, updating `cached_track`/`cached_state` and calling `reselect_active_inner()` on each event
 6. `StateChanged` events trigger `reselect_active()` to re-evaluate active source
-7. Adapter emits `TrackChanged` -> Manager emits to UI -> title label updates
+7. Adapter emits `TrackChanged` -> Manager updates cache, forwards to UI -> title label updates
 8. User clicks Next -> UI sends `Message::Next` -> Manager calls `active.next().await` -> D-Bus call `org.mpris.MediaPlayer2.Player.Next` -> Brave skips video
 9. Brave emits `PropertiesChanged` -> adapter watch task updates cache -> emits event -> forward to UI
 
