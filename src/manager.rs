@@ -2,13 +2,16 @@ use crate::error::AppError;
 use crate::message::AppMessage;
 use crate::mpris::{MediaEvent, MediaSource, PlaybackState, TrackInfo};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
+use tokio::time::timeout;
 use zbus::{Connection, Proxy};
 
 use super::mpris::MprisAdapter;
 
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
+const MPRIS_CALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct MediaSourceManager {
     connection: Option<Arc<Connection>>,
@@ -161,8 +164,20 @@ impl MediaSourceManager {
         let mut cached_tracks: Vec<Option<TrackInfo>> = Vec::with_capacity(new_sources.len());
 
         for (i, src) in new_sources.iter().enumerate() {
-            let state = src.get_state().await;
-            let track = src.get_track().await;
+            let state = match timeout(MPRIS_CALL_TIMEOUT, src.get_state()).await {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(source = %src.display_name(), "get_state() timed out");
+                    PlaybackState::Stopped
+                }
+            };
+            let track = match timeout(MPRIS_CALL_TIMEOUT, src.get_track()).await {
+                Ok(t) => t,
+                Err(_) => {
+                    tracing::warn!(source = %src.display_name(), "get_track() timed out");
+                    None
+                }
+            };
             cached_states.push(state.clone());
             cached_tracks.push(track.clone());
             tracing::debug!(index = i, source = %src.display_name(), ?state, has_track = track.is_some(), "Cached MPRIS source state");
@@ -217,38 +232,51 @@ impl MediaSourceManager {
             let sender_for_task = sender.clone();
             let handle = tokio::spawn(async move {
                 let mut rx = src.subscribe();
-                while let Ok(event) = rx.recv().await {
-                    match &event {
-                        MediaEvent::StateChanged(state) => {
-                            *cached_state_fwd.write().await = state.clone();
-                            let current_active = active_fwd.read().await.clone();
-                            let active_id = current_active.as_ref().map(|s| s.id());
-                            if active_id.is_none() || active_id == Some(src_id.as_str()) {
-                                *active_fwd.write().await = Some(src.clone());
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            match &event {
+                                MediaEvent::StateChanged(state) => {
+                                    *cached_state_fwd.write().await = state.clone();
+                                    let current_active = active_fwd.read().await.clone();
+                                    let active_id = current_active.as_ref().map(|s| s.id());
+                                    if active_id.is_none() || active_id == Some(src_id.as_str()) {
+                                        *active_fwd.write().await = Some(src.clone());
+                                    }
+                                    Self::reselect_active_inner(
+                                        &sources_fwd,
+                                        &active_fwd,
+                                        &cached_state_fwd,
+                                        &cached_track_fwd,
+                                        sender_for_task.clone(),
+                                    )
+                                    .await;
+                                }
+                                MediaEvent::TrackChanged(track) => {
+                                    *cached_track_fwd.write().await = Some(track.clone());
+                                    Self::reselect_active_inner(
+                                        &sources_fwd,
+                                        &active_fwd,
+                                        &cached_state_fwd,
+                                        &cached_track_fwd,
+                                        sender_for_task.clone(),
+                                    )
+                                    .await;
+                                }
+                                MediaEvent::SourceListChanged => {}
                             }
-                            Self::reselect_active_inner(
-                                &sources_fwd,
-                                &active_fwd,
-                                &cached_state_fwd,
-                                &cached_track_fwd,
-                                sender_for_task.clone(),
-                            )
-                            .await;
+                            let _ = sender_clone.send(event);
                         }
-                        MediaEvent::TrackChanged(track) => {
-                            *cached_track_fwd.write().await = Some(track.clone());
-                            Self::reselect_active_inner(
-                                &sources_fwd,
-                                &active_fwd,
-                                &cached_state_fwd,
-                                &cached_track_fwd,
-                                sender_for_task.clone(),
-                            )
-                            .await;
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                source = %src_id,
+                                skipped,
+                                "Adapter event forwarder lagged; continuing"
+                            );
+                            continue;
                         }
-                        MediaEvent::SourceListChanged => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                    let _ = sender_clone.send(event);
                 }
             });
             handles.push(handle);
@@ -326,7 +354,13 @@ impl MediaSourceManager {
         let mut paused_idx: Option<usize> = None;
 
         for (i, src) in sources.iter().enumerate() {
-            let state = src.get_state().await;
+            let state = match timeout(MPRIS_CALL_TIMEOUT, src.get_state()).await {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(source = %src.display_name(), "get_state() timed out in reselect_active_inner");
+                    PlaybackState::Stopped
+                }
+            };
             match state {
                 PlaybackState::Playing if playing_idx.is_none() => playing_idx = Some(i),
                 PlaybackState::Paused if paused_idx.is_none() => paused_idx = Some(i),
@@ -350,10 +384,22 @@ impl MediaSourceManager {
             *active_lock.write().await = new_active.clone();
             tracing::info!(source = ?new_active.as_ref().map(|source| source.display_name()), "Active MPRIS source changed");
             if let Some(src) = new_active {
-                let state = src.get_state().await;
+                let state = match timeout(MPRIS_CALL_TIMEOUT, src.get_state()).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::warn!(source = %src.display_name(), "get_state() timed out");
+                        PlaybackState::Stopped
+                    }
+                };
                 *cached_state.write().await = state.clone();
                 let _ = sender.send(MediaEvent::StateChanged(state));
-                let track = src.get_track().await;
+                let track = match timeout(MPRIS_CALL_TIMEOUT, src.get_track()).await {
+                    Ok(t) => t,
+                    Err(_) => {
+                        tracing::warn!(source = %src.display_name(), "get_track() timed out");
+                        None
+                    }
+                };
                 if let Some(t) = track {
                     *cached_track.write().await = Some(t.clone());
                     let _ = sender.send(MediaEvent::TrackChanged(t));

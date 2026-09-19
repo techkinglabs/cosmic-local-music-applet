@@ -1,7 +1,6 @@
 # Rust build
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # COSMIC / Just
 /result

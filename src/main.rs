@@ -7,6 +7,7 @@ use cosmic_media_applet::mpris::{MediaEvent, PlaybackState, TrackInfo};
 use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 use tracing_subscriber::EnvFilter;
 
 pub struct MediaApplet {
@@ -85,9 +86,15 @@ impl cosmic::iced::advanced::subscription::Recipe for BroadcastSubscription {
     ) -> futures::stream::BoxStream<'static, Self::Output> {
         let receiver = self.sender.subscribe();
         Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
-            match rx.recv().await {
-                Ok(event) => Some((Message::MediaEvent(event), rx)),
-                Err(_) => None,
+            loop {
+                match rx.recv().await {
+                    Ok(event) => return Some((Message::MediaEvent(event), rx)),
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "Media event subscriber lagged behind; continuing");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => return None,
+                }
             }
         }))
     }

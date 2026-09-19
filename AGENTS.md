@@ -33,4 +33,4 @@ pkill cosmic-panel
 
 ## Known issues for future work
 - Proxy caching in adapter (currently creates new Proxy per call)
-- Watch task handles not explicitly aborted on Drop (process exit handles cleanup)
+- do_scan rebuilds all adapters on every NameOwnerChanged; diff-based incremental update would reduce churn

@@ -269,9 +269,10 @@ impl MediaSource for MprisAdapter {
             "Paused" => PlaybackState::Paused,
             _ => PlaybackState::Stopped,
         };
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = ps.clone();
+         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = ps.clone();
         ps
     }
+
     async fn play_pause(&self) -> anyhow::Result<()> {
         let p = Proxy::new(
             &self.connection,
@@ -307,6 +308,13 @@ impl MediaSource for MprisAdapter {
     }
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<MediaEvent> {
         self.event_sender.subscribe()
+    }
+}
+
+impl Drop for MprisAdapter {
+    fn drop(&mut self) {
+        self._watch_handle.abort();
+        tracing::debug!(bus_name = %self.bus_name, "Aborted MPRIS PropertiesChanged watch task");
     }
 }
 
