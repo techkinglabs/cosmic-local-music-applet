@@ -1,5 +1,4 @@
 use cosmic::applet;
-use cosmic::iced::Length;
 use cosmic::iced::advanced::subscription::from_recipe;
 use cosmic::prelude::*;
 use cosmic_media_applet::manager::MediaSourceManager;
@@ -48,30 +47,6 @@ impl MediaApplet {
             None => "No media".to_string(),
         };
         tracing::debug!(state = ?self.current_state, "Updated playback display");
-    }
-
-    fn max_title_length(&self) -> usize {
-        let bounds = self.core.applet.suggested_bounds;
-        let max_len = match bounds {
-            Some(b) => {
-                let icon_w = self.core.applet.suggested_size(true).0 as f32;
-                let padding = self.core.applet.suggested_padding(true).0 as f32;
-                let button_count = 3.0;
-                let spacing = 6.0;
-                let used = (icon_w + padding * 2.0) * button_count + spacing * (button_count - 1.0);
-                let available = b.width - used;
-                if available <= 0.0 {
-                    0
-                } else {
-                    let avg_char_w = 7.0_f32;
-                    let len = (available / avg_char_w).floor() as usize;
-                    len.min(40)
-                }
-            }
-            None => 30,
-        };
-        tracing::debug!(bounds = ?bounds, max_len, "Computed max_title_length");
-        max_len
     }
 }
 
@@ -282,28 +257,22 @@ impl cosmic::Application for MediaApplet {
             .icon_button("media-skip-forward-symbolic")
             .on_press(Message::Next);
 
-        let max_len = self.max_title_length();
-        let title_widget = if max_len > 0 {
-            let title: String = self.current_track.chars().take(max_len).collect();
-            Some(
-                cosmic::widget::text(title)
-                    .size(14)
-                    .width(Length::FillPortion(1)),
-            )
-        } else {
-            None
-        };
+        let title = cosmic::widget::text(&self.current_track)
+            .size(14)
+            .ellipsize(cosmic::iced::core::text::Ellipsize::End(
+                cosmic::iced::core::text::EllipsizeHeightLimit::Lines(1),
+            ));
 
-        let mut row = cosmic::widget::Row::new()
+        let row = cosmic::widget::Row::new()
             .push(previous_btn)
             .push(play_pause_btn)
             .push(next_btn)
+            .push(title)
             .spacing(6)
-            .padding([4, 8]);
-        if let Some(tw) = title_widget {
-            row = row.push(tw);
-        }
-        row.into()
+            .padding([4, 8])
+            .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        self.core.applet.autosize_window(row).into()
     }
 
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {

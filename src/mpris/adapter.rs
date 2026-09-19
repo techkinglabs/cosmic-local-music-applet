@@ -16,8 +16,8 @@ pub struct MprisAdapter {
     source_id: String,
     connection: Arc<Connection>,
     event_sender: broadcast::Sender<MediaEvent>,
-    state: Mutex<PlaybackState>,
-    track: Mutex<Option<TrackInfo>>,
+    state: Arc<Mutex<PlaybackState>>,
+    track: Arc<Mutex<Option<TrackInfo>>>,
     _watch_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -33,7 +33,7 @@ impl MprisAdapter {
         let source_id = display_name.clone();
         let (event_sender, _) = broadcast::channel(32);
 
-        let state = match proxy.get_property::<String>("PlaybackStatus").await {
+        let state = Arc::new(Mutex::new(match proxy.get_property::<String>("PlaybackStatus").await {
             Ok(s) => match s.as_str() {
                 "Playing" => PlaybackState::Playing,
                 "Paused" => PlaybackState::Paused,
@@ -43,13 +43,15 @@ impl MprisAdapter {
                 tracing::warn!(bus_name = %bus_name, error = %e, "Failed to read initial PlaybackStatus");
                 PlaybackState::Stopped
             }
-        };
-        let track = Self::fetch_track(&proxy, &source_id).await;
-        tracing::info!(bus_name = %bus_name, ?state, has_track = track.is_some(), "Initialized MPRIS adapter");
+        }));
+        let track = Arc::new(Mutex::new(Self::fetch_track(&proxy, &source_id).await));
+        tracing::info!(bus_name = %bus_name, ?state, has_track = track.lock().unwrap().is_some(), "Initialized MPRIS adapter");
 
         let conn_clone = connection.clone();
         let sender_clone = event_sender.clone();
         let bus_name_clone = bus_name.clone();
+        let track_clone = track.clone();
+        let state_clone = state.clone();
 
         let _watch_handle = tokio::spawn(async move {
             let props_proxy = match PropertiesProxy::new(
@@ -98,11 +100,11 @@ impl MprisAdapter {
                             _ => PlaybackState::Stopped,
                         };
                         tracing::info!(bus_name = %bus_name_clone, ?ps, "MPRIS playback state changed");
+                        *state_clone.lock().unwrap() = ps.clone();
                         let _ = sender_clone.send(MediaEvent::StateChanged(ps));
                     }
                 }
                 if let Some(v) = changed.get("Metadata") {
-                    tracing::debug!(bus_name = %bus_name_clone, v = ?v, "Metadata value type");
                     if let Value::Dict(dict) = v {
                         let mut map = HashMap::new();
                         for (k, vv) in dict.iter() {
@@ -112,8 +114,11 @@ impl MprisAdapter {
                         }
                         if let Some(t) = Self::metadata_to_track(&map, &bus_name_clone) {
                             tracing::info!(bus_name = %bus_name_clone, title = %t.title, artist = %t.artist, "MPRIS metadata changed");
+                            *track_clone.lock().unwrap() = Some(t.clone());
                             let _ = sender_clone.send(MediaEvent::TrackChanged(t));
                         }
+                    } else {
+                        tracing::debug!(bus_name = %bus_name_clone, "Metadata is not a Value::Dict");
                     }
                 }
             }
@@ -126,8 +131,8 @@ impl MprisAdapter {
             source_id,
             connection,
             event_sender,
-            state: Mutex::new(state),
-            track: Mutex::new(track),
+            state,
+            track,
             _watch_handle,
         })
     }
@@ -135,6 +140,7 @@ impl MprisAdapter {
     fn extract_string(v: &Value<'_>) -> Option<String> {
         match v {
             Value::Str(s) => Some(s.to_string()),
+            Value::Value(inner) => Self::extract_string(inner),
             _ => None,
         }
     }
@@ -148,19 +154,26 @@ impl MprisAdapter {
         metadata: &HashMap<String, Value<'_>>,
         source_id: &str,
     ) -> Option<TrackInfo> {
-        let title = metadata
-            .get("xesam:title")
+        let title_val = metadata.get("xesam:title");
+        let title = title_val
             .and_then(|v| Self::extract_string(v))
             .unwrap_or_default();
         let artist = metadata
             .get("xesam:artist")
-            .map(|v| match v {
-                Value::Array(arr) => arr
-                    .iter()
-                    .filter_map(|x| Self::extract_string(x))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                _ => Self::extract_string(v).unwrap_or_default(),
+            .and_then(|v| {
+                let inner = match v {
+                    Value::Value(iv) => iv,
+                    other => other,
+                };
+                match inner {
+                    Value::Array(arr) => Some(
+                        arr.iter()
+                            .filter_map(|x| Self::extract_string(x))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    _ => Self::extract_string(inner),
+                }
             })
             .unwrap_or_default();
         let album = metadata
