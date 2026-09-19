@@ -1,6 +1,6 @@
 use cosmic::applet;
-use cosmic::iced::advanced::subscription::from_recipe;
 use cosmic::iced::Length;
+use cosmic::iced::advanced::subscription::from_recipe;
 use cosmic::prelude::*;
 use cosmic_media_applet::manager::MediaSourceManager;
 use cosmic_media_applet::message::AppMessage;
@@ -34,24 +34,19 @@ pub enum Message {
 impl MediaApplet {
     fn apply_track_state(&mut self, track: Option<TrackInfo>, state: PlaybackState) {
         self.current_track_info = track.clone();
-        self.current_state = state.clone();
-        if let Some(t) = track {
-            let title = t.to_string();
-            let max_len = self.max_title_length();
-            let display = if title.chars().count() > max_len {
-                title
-                    .chars()
-                    .take(max_len)
-                    .collect::<String>()
-                + "..."
-            } else {
-                title
-            };
-            self.current_track = display;
-            tracing::debug!(track = %self.current_track, source = %t.source_id, "Updated track display");
-        } else {
-            self.current_track = "No media".to_string();
-        }
+        self.current_state = state;
+        self.current_track = match track {
+            Some(t) => {
+                let track_display = t.to_string();
+                tracing::debug!(track = %track_display, source = %t.source_id, "Updated track display");
+                if track_display.is_empty() {
+                    "No media".to_string()
+                } else {
+                    track_display
+                }
+            }
+            None => "No media".to_string(),
+        };
         tracing::debug!(state = ?self.current_state, "Updated playback display");
     }
 
@@ -142,9 +137,9 @@ impl cosmic::Application for MediaApplet {
             Self {
                 core,
                 manager: None,
-                 current_track: "No media".to_string(),
-                 current_track_info: None,
-                 current_state: PlaybackState::Stopped,
+                current_track: "No media".to_string(),
+                current_track_info: None,
+                current_state: PlaybackState::Stopped,
             },
             cosmic::app::Task::perform(
                 async {
@@ -268,21 +263,24 @@ impl cosmic::Application for MediaApplet {
 
     fn view(&self) -> Element<'_, Self::Message> {
         let play_icon = match self.current_state {
-            PlaybackState::Playing => "⏸",
-            PlaybackState::Paused | PlaybackState::Stopped => "▶",
+            PlaybackState::Playing => "media-playback-pause-symbolic",
+            PlaybackState::Paused | PlaybackState::Stopped => "media-playback-start-symbolic",
         };
-        let previous_btn = self.core.applet.text_button(
-            cosmic::widget::text("⏮").size(14),
-            Message::Previous,
-        );
-        let play_pause_btn = self.core.applet.text_button(
-            cosmic::widget::text(play_icon).size(14),
-            Message::PlayPause,
-        );
-        let next_btn = self.core.applet.text_button(
-            cosmic::widget::text("⏭").size(14),
-            Message::Next,
-        );
+        let previous_btn = self
+            .core
+            .applet
+            .icon_button("media-skip-backward-symbolic")
+            .on_press(Message::Previous);
+        let play_pause_btn = self
+            .core
+            .applet
+            .icon_button(play_icon)
+            .on_press(Message::PlayPause);
+        let next_btn = self
+            .core
+            .applet
+            .icon_button("media-skip-forward-symbolic")
+            .on_press(Message::Next);
 
         let max_len = self.max_title_length();
         let title_widget = if max_len > 0 {
@@ -328,14 +326,16 @@ fn init_tracing() {
     let log_path = std::env::var("HOME")
         .ok()
         .map(|h| format!("{h}/.local/state/cosmic-media-applet.log"));
-    let file_result = log_path
-        .as_ref()
-        .and_then(|p| {
-            if let Some(parent) = std::path::Path::new(p).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
-        });
+    let file_result = log_path.as_ref().and_then(|p| {
+        if let Some(parent) = std::path::Path::new(p).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    });
     match file_result {
         Some(file) => {
             let _ = tracing_subscriber::fmt()

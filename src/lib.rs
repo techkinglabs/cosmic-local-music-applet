@@ -4,9 +4,7 @@
 //! (MPRIS2 protocol) without requiring local playback capability.
 
 pub use self::message::AppMessage;
-pub use self::mpris::{
-    MediaEvent, MediaSource, MprisAdapter, PlaybackState, TrackInfo,
-};
+pub use self::mpris::{MediaEvent, MediaSource, MprisAdapter, PlaybackState, TrackInfo};
 
 /// Media source trait for controlling playback.
 pub mod error;

@@ -45,7 +45,8 @@ impl MediaSourceManager {
         let watch_handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>> =
             Arc::new(RwLock::new(Vec::new()));
         let cached_track: Arc<RwLock<Option<TrackInfo>>> = Arc::new(RwLock::new(None));
-        let cached_state: Arc<RwLock<PlaybackState>> = Arc::new(RwLock::new(PlaybackState::Stopped));
+        let cached_state: Arc<RwLock<PlaybackState>> =
+            Arc::new(RwLock::new(PlaybackState::Stopped));
 
         let conn_clone = connection.clone();
         let sources_clone = sources.clone();
@@ -102,13 +103,13 @@ impl MediaSourceManager {
                         if name.starts_with(MPRIS_PREFIX) {
                             tracing::debug!(name=%name, "MPRIS name changed, rescanning");
                             Self::do_scan(
-                                 &conn_clone,
-                                 &sources_clone,
-                                 &active_clone,
-                                 &sender_clone,
-                                 &watch_handles_clone,
-                                 &cached_track_clone,
-                                 &cached_state_clone,
+                                &conn_clone,
+                                &sources_clone,
+                                &active_clone,
+                                &sender_clone,
+                                &watch_handles_clone,
+                                &cached_track_clone,
+                                &cached_state_clone,
                             )
                             .await;
                         }
@@ -183,8 +184,6 @@ impl MediaSourceManager {
         *sources_lock.write().await = new_sources;
         *active_lock.write().await = new_active.clone();
 
-        let _ = sender.send(MediaEvent::SourceListChanged);
-
         if let Some(_active) = new_active {
             if let Some(idx) = playing_idx.or(paused_idx) {
                 let state = cached_states
@@ -198,7 +197,13 @@ impl MediaSourceManager {
                     let _ = sender.send(MediaEvent::TrackChanged(track));
                 }
             }
+        } else {
+            *cached_state.write().await = PlaybackState::Stopped;
+            let _ = sender.send(MediaEvent::StateChanged(PlaybackState::Stopped));
+            *cached_track.write().await = None;
         }
+
+        let _ = sender.send(MediaEvent::SourceListChanged);
 
         let mut handles = Vec::new();
         let sources: Vec<Arc<dyn MediaSource>> = sources_lock.read().await.clone();
@@ -294,7 +299,16 @@ impl MediaSourceManager {
             let watch_handles = self._watch_handles.clone();
             let cached_track = self.cached_track.clone();
             let cached_state = self.cached_state.clone();
-            Self::do_scan(conn, &sources, &active, &sender, &watch_handles, &cached_track, &cached_state).await;
+            Self::do_scan(
+                conn,
+                &sources,
+                &active,
+                &sender,
+                &watch_handles,
+                &cached_track,
+                &cached_state,
+            )
+            .await;
         } else {
             tracing::warn!("Manual MPRIS scan skipped; manager has no D-Bus connection");
         }
@@ -437,7 +451,12 @@ impl MediaSourceManager {
 
     pub fn cached_state(&self) -> (Option<TrackInfo>, PlaybackState) {
         let track = self.cached_track.try_read().ok().and_then(|g| g.clone());
-        let state = self.cached_state.try_read().ok().map(|g| g.clone()).unwrap_or(PlaybackState::Stopped);
+        let state = self
+            .cached_state
+            .try_read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or(PlaybackState::Stopped);
         tracing::debug!(track = ?track, state = ?state, "Read cached state");
         (track, state)
     }

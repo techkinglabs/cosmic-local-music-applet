@@ -23,7 +23,14 @@ pub struct TrackInfo {
 
 impl fmt::Display for TrackInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} - {}", self.artist, self.title)
+        let has_artist = !self.artist.is_empty();
+        let has_title = !self.title.is_empty();
+        match (has_artist, has_title) {
+            (true, true) => write!(f, "{} \u{2014} {}", self.artist, self.title),
+            (true, false) => write!(f, "{}", self.artist),
+            (false, true) => write!(f, "{}", self.title),
+            (false, false) => Ok(()),
+        }
     }
 }
 
