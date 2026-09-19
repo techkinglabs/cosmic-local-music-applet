@@ -6,7 +6,7 @@ APP_ID="com.system76.CosmicMediaApplet"
 BIN_NAME="cosmic-media-applet"
 DESKTOP_FILE="${APP_ID}.desktop"
 BUILD_DIR="target/release"
-USAGE="Usage: $0 [--uninstall] [--prefix /path/to/prefix] [--build]"
+USAGE="Usage: $0 [--uninstall] [--prefix /path/to/prefix] [--build] [--local]"
 
 RESET='\033[0m'
 RED='\033[0;31m'
@@ -30,6 +30,7 @@ UNINSTALL_MODE=false
 PREFIX=""
 FORCE_BUILD=false
 REQUIRE_SUDO=false
+LOCAL_BINARY=false
 
 determine_sudo_needed() {
     if [[ -z "${PREFIX}" ]] || [[ "${PREFIX}" == "/" ]]; then
@@ -60,6 +61,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --build|-b)
             FORCE_BUILD=true
+            shift
+            ;;
+        --local|--user)
+            LOCAL_BINARY=true
             shift
             ;;
         --help|-h)
@@ -160,6 +165,22 @@ install_files() {
     local target_bin="${target_lib_dir}/${BIN_NAME}"
     ${SUDO} install -m 0755 "${BUILD_DIR}/${BIN_NAME}" "${target_bin}" || die "Failed to install binary"
     log_ok "Binary installed: ${target_bin}"
+
+    local user_bin_dir="${HOME}/.local/bin"
+    if [[ -z "${PREFIX}" ]] || [[ "${PREFIX}" == "/" ]]; then
+        mkdir -p "${user_bin_dir}" 2>/dev/null || true
+        if [[ -d "${user_bin_dir}" ]]; then
+            install -m 0755 "${BUILD_DIR}/${BIN_NAME}" "${user_bin_dir}/${BIN_NAME}" \
+                || log_warn "Failed to update local binary at ${user_bin_dir}/${BIN_NAME}"
+            log_ok "Local binary updated: ${user_bin_dir}/${BIN_NAME}"
+        fi
+    fi
+    if [[ "${LOCAL_BINARY}" == true ]]; then
+        mkdir -p "${user_bin_dir}" || die "Failed to create ${user_bin_dir}"
+        install -m 0755 "${BUILD_DIR}/${BIN_NAME}" "${user_bin_dir}/${BIN_NAME}" \
+            || die "Failed to install local binary"
+        log_ok "Local binary installed: ${user_bin_dir}/${BIN_NAME}"
+    fi
 
     if [[ -z "${PREFIX}" ]]; then
         local symlink_path="${target_bin_dir}/${BIN_NAME}"

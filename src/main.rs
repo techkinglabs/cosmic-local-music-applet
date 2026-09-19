@@ -1,24 +1,21 @@
-use cosmic_media_applet::mpris::{MediaEvent, PlaybackState, TrackInfo};
+use cosmic::applet;
+use cosmic::iced::advanced::subscription::from_recipe;
+use cosmic::iced::Length;
+use cosmic::prelude::*;
 use cosmic_media_applet::manager::MediaSourceManager;
 use cosmic_media_applet::message::AppMessage;
-use cosmic::applet;
-use cosmic::prelude::*;
-use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
-use cosmic::iced::advanced::subscription::from_recipe;
-use cosmic::iced::window;
+use cosmic_media_applet::mpris::{MediaEvent, PlaybackState, TrackInfo};
 use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing;
+use tracing_subscriber::EnvFilter;
 
 const MAX_TITLE_LENGTH: usize = 30;
 
 pub struct MediaApplet {
     core: cosmic::Core,
     manager: Option<Arc<MediaSourceManager>>,
-    popup: Option<window::Id>,
     current_track: String,
-    full_title: String,
     play_icon: &'static str,
     current_track_info: Option<TrackInfo>,
     current_state: PlaybackState,
@@ -29,8 +26,6 @@ pub enum Message {
     Previous,
     PlayPause,
     Next,
-    TogglePopup,
-    PopupClosed(window::Id),
     MediaEvent(MediaEvent),
     ManagerReady(Arc<MediaSourceManager>),
     UpdateState {
@@ -44,19 +39,27 @@ impl MediaApplet {
         self.current_track_info = track.clone();
         self.current_state = state.clone();
         if let Some(t) = track {
-            self.full_title = t.to_string();
-            let display = if self.full_title.chars().count() > MAX_TITLE_LENGTH {
-                self.full_title.chars().take(MAX_TITLE_LENGTH).collect::<String>() + "..."
+            let title = t.to_string();
+            let display = if title.chars().count() > MAX_TITLE_LENGTH {
+                title
+                    .chars()
+                    .take(MAX_TITLE_LENGTH)
+                    .collect::<String>()
+                    + "..."
             } else {
-                self.full_title.clone()
+                title
             };
             self.current_track = display;
+            tracing::debug!(track = %self.current_track, source = %t.source_id, "Updated track display");
+        } else {
+            self.current_track = "No media".to_string();
         }
         self.play_icon = match state {
             PlaybackState::Playing => "⏸",
             PlaybackState::Paused => "▶",
             PlaybackState::Stopped => "▶",
         };
+        tracing::debug!(state = ?self.current_state, icon = %self.play_icon, "Updated playback display");
     }
 }
 
@@ -66,8 +69,6 @@ impl std::fmt::Debug for Message {
             Message::Previous => f.debug_struct("Previous").finish(),
             Message::PlayPause => f.debug_struct("PlayPause").finish(),
             Message::Next => f.debug_struct("Next").finish(),
-            Message::TogglePopup => f.debug_struct("TogglePopup").finish(),
-            Message::PopupClosed(id) => f.debug_struct("PopupClosed").field("id", id).finish(),
             Message::MediaEvent(e) => f.debug_struct("MediaEvent").field("event", e).finish(),
             Message::ManagerReady(_) => f.debug_struct("ManagerReady").finish(),
             Message::UpdateState { track, state } => f
@@ -119,50 +120,50 @@ impl cosmic::Application for MediaApplet {
         &mut self.core
     }
 
-    fn init(
-        core: cosmic::Core,
-        _flags: Self::Flags,
-    ) -> (Self, cosmic::app::Task<Self::Message>) {
+    fn init(core: cosmic::Core, _flags: Self::Flags) -> (Self, cosmic::app::Task<Self::Message>) {
         (
             Self {
                 core,
                 manager: None,
-                current_track: "No media".to_string(),
-                full_title: String::new(),
-                play_icon: "▶",
-                popup: None,
-                current_track_info: None,
-                current_state: PlaybackState::Stopped,
+                 current_track: "No media".to_string(),
+                 play_icon: "▶",
+                 current_track_info: None,
+                 current_state: PlaybackState::Stopped,
             },
             cosmic::app::Task::perform(
-                async { MediaSourceManager::new().await },
+                async {
+                    tracing::info!("Initializing MediaSourceManager");
+                    MediaSourceManager::new().await
+                },
                 |result| match result {
-                    Ok(manager) => cosmic::Action::App(Message::ManagerReady(Arc::new(manager))),
+                    Ok(manager) => {
+                        tracing::info!("MediaSourceManager initialized");
+                        cosmic::Action::App(Message::ManagerReady(Arc::new(manager)))
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to initialize MediaSourceManager");
-                        cosmic::Action::App(Message::ManagerReady(Arc::new(MediaSourceManager::new_empty())))
+                        cosmic::Action::App(Message::ManagerReady(Arc::new(
+                            MediaSourceManager::new_empty(),
+                        )))
                     }
                 },
             ),
         )
     }
 
-    fn on_close_requested(&self, id: window::Id) -> Option<Self::Message> {
-        Some(Message::PopupClosed(id))
-    }
-
-    fn update(
-        &mut self,
-        message: Self::Message,
-    ) -> cosmic::app::Task<Self::Message> {
+    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
         match message {
             Message::Previous => {
                 if let Some(ref manager) = self.manager {
+                    tracing::info!("Previous requested");
                     let m = manager.clone();
                     return cosmic::app::Task::perform(
                         async move { m.route(AppMessage::Previous).await },
                         |result| match result {
-                            Ok(_) => cosmic::Action::None,
+                            Ok(_) => {
+                                tracing::info!("Previous command completed");
+                                cosmic::Action::None
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, "Previous command failed");
                                 cosmic::Action::None
@@ -173,11 +174,15 @@ impl cosmic::Application for MediaApplet {
             }
             Message::PlayPause => {
                 if let Some(ref manager) = self.manager {
+                    tracing::info!("PlayPause requested");
                     let m = manager.clone();
                     return cosmic::app::Task::perform(
                         async move { m.route(AppMessage::PlayPause).await },
                         |result| match result {
-                            Ok(_) => cosmic::Action::None,
+                            Ok(_) => {
+                                tracing::info!("PlayPause command completed");
+                                cosmic::Action::None
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, "PlayPause command failed");
                                 cosmic::Action::None
@@ -188,11 +193,15 @@ impl cosmic::Application for MediaApplet {
             }
             Message::Next => {
                 if let Some(ref manager) = self.manager {
+                    tracing::info!("Next requested");
                     let m = manager.clone();
                     return cosmic::app::Task::perform(
                         async move { m.route(AppMessage::Next).await },
                         |result| match result {
-                            Ok(_) => cosmic::Action::None,
+                            Ok(_) => {
+                                tracing::info!("Next command completed");
+                                cosmic::Action::None
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, "Next command failed");
                                 cosmic::Action::None
@@ -201,61 +210,40 @@ impl cosmic::Application for MediaApplet {
                     );
                 }
             }
-            Message::TogglePopup => {
-                if let Some(id) = self.popup.take() {
-                    return destroy_popup(id);
-                } else {
-                    let new_id = window::Id::unique();
-                    self.popup.replace(new_id);
-                    let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
-                        new_id,
-                        None,
-                        None,
-                        None,
-                    );
-                    popup_settings.positioner.size_limits = cosmic::iced::Limits::NONE
-                        .max_width(372.0)
-                        .min_width(300.0)
-                        .min_height(200.0)
-                        .max_height(1080.0);
-                    return get_popup(popup_settings);
-                }
-            }
-            Message::PopupClosed(id) => {
-                if self.popup.as_ref() == Some(&id) {
-                    self.popup = None;
-                }
-            }
             Message::ManagerReady(manager) => {
                 self.manager = Some(manager.clone());
-                let m = manager.clone();
-                return cosmic::app::Task::perform(
-                    async move {
-                        (m.active_track().await, m.active_state().await)
-                    },
-                    |(track, state)| cosmic::Action::App(Message::UpdateState { track, state }),
-                );
+                tracing::info!("MediaSourceManager ready; reading initial track and state");
+                let (track, state) = manager.cached_state();
+                tracing::debug!(?track, ?state, "Using cached initial media state");
+                self.apply_track_state(track, state);
             }
             Message::MediaEvent(event) => {
+                tracing::debug!(?event, "Received media event");
                 match event {
                     MediaEvent::StateChanged(state) => {
-                        self.apply_track_state(self.current_track_info.clone(), state);
-                        if let Some(ref m) = self.manager {
-                            let m2 = m.clone();
-                            return cosmic::app::Task::perform(
-                                async move { m2.reselect_active().await },
-                                |_| cosmic::Action::None,
-                            );
-                        }
+                        tracing::debug!(?state, "Received StateChanged from broadcast");
+                        let state_clone = state.clone();
+                        let (track, _) = match &self.manager {
+                            Some(m) => m.cached_state(),
+                            None => (self.current_track_info.clone(), state_clone),
+                        };
+                        self.apply_track_state(track, state);
                     }
                     MediaEvent::TrackChanged(track) => {
                         self.apply_track_state(Some(track), self.current_state.clone());
                     }
-                    MediaEvent::SourceListChanged => {}
+                    MediaEvent::SourceListChanged => {
+                        tracing::info!("MPRIS source list changed; using cached state");
+                        let (track, state) = match &self.manager {
+                            Some(m) => m.cached_state(),
+                            None => (None, PlaybackState::Stopped),
+                        };
+                        self.apply_track_state(track, state);
+                    }
                 }
             }
             Message::UpdateState { track, state } => {
+                tracing::debug!(?track, ?state, "Applied initial media state");
                 self.apply_track_state(track, state);
             }
         }
@@ -263,45 +251,34 @@ impl cosmic::Application for MediaApplet {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
+        let previous_btn = cosmic::widget::button::text("⏮")
+            .on_press(Message::Previous)
+            .padding(4);
+        let play_pause_btn = cosmic::widget::button::text(self.play_icon)
+            .on_press(Message::PlayPause)
+            .padding(4);
+        let next_btn = cosmic::widget::button::text("⏭")
+            .on_press(Message::Next)
+            .padding(4);
+        let title_widget = cosmic::widget::text(&self.current_track)
+            .size(14)
+            .width(Length::FillPortion(1));
+
         cosmic::widget::Row::new()
-            .push(
-                self.core
-                    .applet
-                    .icon_button("multimedia-player-symbolic")
-                    .on_press(Message::TogglePopup),
-            )
-            .push(cosmic::widget::text("Media").size(14))
-            .spacing(4)
-            .padding([6, 10])
-            .into()
-    }
-
-    fn view_window(&self, _id: window::Id) -> Element<'_, Self::Message> {
-        let previous_btn = cosmic::widget::button::text("<<").on_press(Message::Previous);
-        let play_pause_btn = cosmic::widget::button::text(self.play_icon).on_press(Message::PlayPause);
-        let next_btn = cosmic::widget::button::text(">>").on_press(Message::Next);
-
-        let title_widget = cosmic::widget::text(&self.current_track).size(14);
-
-        self.core.applet.popup_container(
-            cosmic::widget::Row::new()
-                .push(previous_btn)
-                .push(play_pause_btn)
-                .push(next_btn)
-                .push(title_widget)
-                .spacing(6)
-                .padding(10)
-        )
+            .push(previous_btn)
+            .push(play_pause_btn)
+            .push(next_btn)
+            .push(title_widget)
+            .spacing(6)
+            .padding([4, 8])
         .into()
     }
 
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
         match &self.manager {
-            Some(manager) => {
-                from_recipe(BroadcastSubscription {
-                    sender: manager.event_sender(),
-                })
-            }
+            Some(manager) => from_recipe(BroadcastSubscription {
+                sender: manager.event_sender(),
+            }),
             None => cosmic::iced::Subscription::none(),
         }
     }
@@ -311,6 +288,33 @@ impl cosmic::Application for MediaApplet {
     }
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("cosmic_media_applet=info"));
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/techking/cosmic-media-applet.log");
+    match log_file {
+        Ok(file) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(file)
+                .with_target(false)
+                .try_init();
+        }
+        Err(e) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .try_init();
+            eprintln!("Failed to open log file: {e}");
+        }
+    }
+}
+
 fn main() -> cosmic::iced::Result {
+    init_tracing();
+    tracing::info!("Media applet starting");
     applet::run::<MediaApplet>(())
 }

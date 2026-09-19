@@ -7,13 +7,12 @@ pub use self::message::AppMessage;
 pub use self::mpris::{
     MediaEvent, MediaSource, MprisAdapter, PlaybackState, TrackInfo,
 };
-pub use self::manager::MediaSourceManager;
 
 /// Media source trait for controlling playback.
 pub mod error;
 /// MPRIS media source manager for discovery and control.
 pub mod manager;
-/// MPRIS adapter for D-Bus communication.
-pub mod mpris;
 /// Application message types.
 pub mod message;
+/// MPRIS adapter for D-Bus communication.
+pub mod mpris;
