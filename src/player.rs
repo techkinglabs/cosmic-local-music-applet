@@ -13,6 +13,157 @@ struct SendableOutputStream(OutputStream);
 unsafe impl Send for SendableOutputStream {}
 unsafe impl Sync for SendableOutputStream {}
 
+struct Minimp3Frame {
+    samples: Vec<i16>,
+}
+
+pub struct Minimp3Source {
+    frames: Arc<Mutex<Vec<Minimp3Frame>>>,
+    current_frame: Arc<Mutex<usize>>,
+    sample_idx: Arc<Mutex<usize>>,
+    sample_rate: u32,
+    channels: u16,
+    total_samples: usize,
+    duration_ms: Option<u64>,
+}
+
+impl Iterator for Minimp3Source {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<i16> {
+        let mut frame_idx = self.current_frame.lock().unwrap();
+        let mut idx = self.sample_idx.lock().unwrap();
+        let frames = self.frames.lock().unwrap();
+
+        loop {
+            if *frame_idx >= frames.len() {
+                *idx = 0;
+                return None;
+            }
+
+            let frame = &frames[*frame_idx];
+            if *idx < frame.samples.len() {
+                let sample = frame.samples[*idx];
+                *idx += 1;
+                return Some(sample);
+            } else {
+                *frame_idx += 1;
+                *idx = 0;
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.total_samples))
+    }
+}
+
+impl Source for Minimp3Source {
+    fn current_frame_len(&self) -> Option<usize> {
+        let frames = self.frames.lock().unwrap();
+        if frames.is_empty() {
+            Some(0)
+        } else {
+            let frame_idx = *self.current_frame.lock().unwrap();
+            if frame_idx < frames.len() {
+                let idx = *self.sample_idx.lock().unwrap();
+                Some(frames[frame_idx].samples.len() - idx.min(frames[frame_idx].samples.len()))
+            } else {
+                Some(0)
+            }
+        }
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.duration_ms.map(|ms| std::time::Duration::from_millis(ms))
+    }
+
+    fn try_seek(&mut self, pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+        let target_sample = (pos.as_secs_f32() * self.sample_rate as f32 * self.channels as f32) as usize;
+        let mut current = 0usize;
+        let mut found_frame = 0usize;
+        let mut found_idx = 0usize;
+        let frames = self.frames.lock().unwrap();
+        for (i, f) in frames.iter().enumerate() {
+            if current + f.samples.len() >= target_sample {
+                found_frame = i;
+                found_idx = target_sample - current;
+                break;
+            }
+            current += f.samples.len();
+        }
+        drop(frames);
+        *self.current_frame.lock().unwrap() = found_frame;
+        *self.sample_idx.lock().unwrap() = found_idx;
+        Ok(())
+    }
+}
+
+fn load_with_minimp3(path: &str) -> Result<Minimp3Source> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
+    let mut decoder = minimp3::Decoder::new(std::io::BufReader::new(file));
+
+    let mut frames: Vec<Minimp3Frame> = Vec::new();
+    let mut sample_rate = 44100u32;
+    let mut channels = 2u16;
+    let mut total_samples = 0usize;
+
+    while let Ok(frame) = decoder.next_frame() {
+        sample_rate = frame.sample_rate as u32;
+        channels = frame.channels as u16;
+        total_samples += frame.data.len();
+        frames.push(Minimp3Frame { samples: frame.data });
+    }
+
+    if frames.is_empty() {
+        return Err(anyhow::anyhow!("Minimp3 decoder produced no frames"));
+    }
+
+    let duration_ms = (total_samples as f64 / sample_rate as f64 / channels as f64 * 1000.0) as u64;
+
+    Ok(Minimp3Source {
+        frames: Arc::new(Mutex::new(frames)),
+        current_frame: Arc::new(Mutex::new(0)),
+        sample_idx: Arc::new(Mutex::new(0)),
+        sample_rate,
+        channels,
+        total_samples,
+        duration_ms: Some(duration_ms),
+    })
+}
+
+fn create_decoder(path: &str, skip: Option<std::time::Duration>) -> Result<Box<dyn Source<Item = i16> + Send>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
+    match Decoder::new(std::io::BufReader::new(file)) {
+        Ok(source) => {
+            if let Some(dur) = skip {
+                Ok(Box::new(source.skip_duration(dur)))
+            } else {
+                Ok(Box::new(source))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "Rodio symphonia decoder failed; falling back to minimp3");
+            let mut source = load_with_minimp3(path)
+                .map_err(|e2| anyhow::anyhow!("Both symphonia and minimp3 decoders failed: symphonia: {}, minimp3: {}", e, e2))?;
+            if let Some(dur) = skip {
+                source.try_seek(dur).ok();
+            }
+            Ok(Box::new(source))
+        }
+    }
+}
+
 pub struct PlayerAdapter {
     event_sender: tokio::sync::broadcast::Sender<MediaEvent>,
     sink: Arc<Mutex<Option<Sink>>>,
@@ -58,6 +209,12 @@ impl PlayerAdapter {
 
     pub async fn play_track(&self, path: &str) -> Result<()> {
         let path_buf = PathBuf::from(path);
+        let path_owned = path.to_string();
+
+        let playlist = self.playlist.lock().unwrap().clone();
+        if let Some(pos) = playlist.iter().position(|t| t.path == path_owned) {
+            *self.playlist_index.lock().unwrap() = Some(pos);
+        }
 
         let track_stat = tokio::task::spawn_blocking({
             let db_path = MusicStatsDb::db_path();
@@ -93,10 +250,12 @@ impl PlayerAdapter {
             }
         }
 
-        let file = std::fs::File::open(&path_buf)
-            .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
-        let source = Decoder::new(std::io::BufReader::new(file))
-            .map_err(|e| anyhow::anyhow!("Failed to decode audio: {}", e))?;
+        let source = tokio::task::spawn_blocking({
+            let path_owned = path.to_string();
+            move || create_decoder(&path_owned, None)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Decoder thread failed: {}", e))??;
 
         let source_duration_ms = source.total_duration()
             .map(|d| d.as_millis() as u64)
@@ -119,26 +278,32 @@ impl PlayerAdapter {
         let volume = *self.volume.lock().unwrap();
 
         {
-            let sink_guard = self.sink.lock().unwrap().take();
-            if let Some(s) = sink_guard {
+            let sink_guard = self.sink.lock().unwrap();
+            if let Some(s) = sink_guard.as_ref() {
                 s.stop();
+                s.clear();
             }
         }
 
-        let (new_sink, wrapped_stream, stream_handle) = {
-            let (stream, stream_handle) = OutputStream::try_default()?;
+        let (new_sink, stream_handle) = {
+            let sh_opt = self._stream_handle.lock().unwrap().clone();
+            let stream_handle = if let Some(sh) = sh_opt {
+                sh
+            } else {
+                let (stream, sh) = OutputStream::try_default()?;
+                *self._stream.lock().unwrap() = Some(SendableOutputStream(stream));
+                sh
+            };
             let new_sink = Sink::try_new(&stream_handle)
                 .map_err(|e| anyhow::anyhow!("Failed to create sink: {}", e))?;
             new_sink.set_volume(volume);
             new_sink.append(source);
-            (new_sink, SendableOutputStream(stream), stream_handle)
+            (new_sink, stream_handle)
         };
 
         {
             let mut sink_guard = self.sink.lock().unwrap();
             *sink_guard = Some(new_sink);
-            let mut stream_guard = self._stream.lock().unwrap();
-            *stream_guard = Some(wrapped_stream);
             let mut sh_guard = self._stream_handle.lock().unwrap();
             *sh_guard = Some(stream_handle);
         }
@@ -149,6 +314,12 @@ impl PlayerAdapter {
         }
         *self.state.lock().unwrap() = PlaybackState::Playing;
         *self.position_start.lock().unwrap() = Some(std::time::Instant::now());
+
+        if let Some(stat) = &track_stat {
+            if let Ok(db) = MusicStatsDb::new() {
+                let _ = db.save_playback_state(Some(&stat.path), 0, "playing");
+            }
+        }
         {
             let mut idx_guard = self.playlist_index.lock().unwrap();
             if let Some(stat) = &track_stat {
@@ -282,8 +453,46 @@ impl PlayerAdapter {
         db.get_tracks_sorted(sort_mode)
     }
 
+    pub async fn set_playlist(&self, tracks: Vec<TrackStat>) {
+        *self.playlist.lock().unwrap() = tracks;
+        *self.playlist_index.lock().unwrap() = None;
+    }
+
+    pub async fn play_track_at(&self, idx: usize) -> Result<()> {
+        let playlist = self.playlist.lock().unwrap().clone();
+        if let Some(track) = playlist.get(idx).cloned() {
+            *self.playlist_index.lock().unwrap() = Some(idx);
+            self.play_track(&track.path).await?;
+        }
+        Ok(())
+    }
+
     pub fn music_folder(&self) -> &std::path::Path {
         &self.music_folder
+    }
+
+    pub async fn resume(&self) -> Result<()> {
+        let db = MusicStatsDb::new()?;
+        if let Some((path_opt, pos_ms, state_str)) = db.get_playback_state() {
+            if let Some(path) = path_opt {
+                if state_str == "playing" || state_str == "paused" {
+                    if let Some(dur) = self.get_track_duration(&path).await {
+                        if pos_ms > 0 && pos_ms < dur {
+                            self.set_position(pos_ms).await?;
+                            return Ok(());
+                        }
+                    }
+                    self.play_track(&path).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_track_duration(&self, path: &str) -> Option<u64> {
+        let db = MusicStatsDb::new().ok()?;
+        db.get_track_by_path(path).ok().flatten().map(|t| t.duration_ms)
     }
 }
 
@@ -316,19 +525,27 @@ impl MediaSource for PlayerAdapter {
     }
 
     async fn play_pause(&self) -> Result<()> {
-        let sink_guard = self.sink.lock().unwrap();
-        if let Some(s) = sink_guard.as_ref() {
-            let is_paused = s.is_paused();
-            if is_paused {
-                s.play();
-                *self.state.lock().unwrap() = PlaybackState::Playing;
-                *self.position_start.lock().unwrap() = Some(std::time::Instant::now());
-                let _ = self.event_sender.send(MediaEvent::StateChanged(PlaybackState::Playing));
-            } else {
-                s.pause();
-                *self.state.lock().unwrap() = PlaybackState::Paused;
-                let _ = self.event_sender.send(MediaEvent::StateChanged(PlaybackState::Paused));
+        let has_sink = {
+            let sink_guard = self.sink.lock().unwrap();
+            sink_guard.is_some()
+        };
+        if has_sink {
+            let sink_guard = self.sink.lock().unwrap();
+            if let Some(s) = sink_guard.as_ref() {
+                let is_paused = s.is_paused();
+                if is_paused {
+                    s.play();
+                    *self.state.lock().unwrap() = PlaybackState::Playing;
+                    *self.position_start.lock().unwrap() = Some(std::time::Instant::now());
+                    let _ = self.event_sender.send(MediaEvent::StateChanged(PlaybackState::Playing));
+                } else {
+                    s.pause();
+                    *self.state.lock().unwrap() = PlaybackState::Paused;
+                    let _ = self.event_sender.send(MediaEvent::StateChanged(PlaybackState::Paused));
+                }
             }
+        } else {
+            self.resume().await?;
         }
         Ok(())
     }
@@ -377,6 +594,16 @@ impl MediaSource for PlayerAdapter {
         *self.state.lock().unwrap() = PlaybackState::Stopped;
         *self.position_start.lock().unwrap() = None;
         *self.current_position_ms.lock().unwrap() = 0;
+
+        let track = self.current_track.lock().unwrap().clone();
+        if let Some(ref t) = track {
+            if let Some(ref path) = t.file_path {
+                if let Ok(db) = MusicStatsDb::new() {
+                    let _ = db.save_playback_state(Some(path), 0, "stopped");
+                }
+            }
+        }
+
         let _ = self.event_sender.send(MediaEvent::StateChanged(PlaybackState::Stopped));
         Ok(())
     }
@@ -395,9 +622,12 @@ impl MediaSource for PlayerAdapter {
                     }
                 }
 
-                let file = std::fs::File::open(path)?;
-                let new_source = Decoder::new(std::io::BufReader::new(file))?;
-                let seeked_source = new_source.skip_duration(skip);
+                let seeked_source = tokio::task::spawn_blocking({
+                    let path_owned = path.to_string();
+                    move || create_decoder(&path_owned, Some(skip))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Decoder thread failed: {}", e))??;
 
                 let volume = *self.volume.lock().unwrap();
                 let stream_handle = {

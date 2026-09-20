@@ -18,3 +18,4 @@ thiserror = "1.0"
 futures = "0.3"
 rusqlite = { version = "0.29", features = ["bundled"] }
 rodio = "0.20"
+minimp3 = "0.6"

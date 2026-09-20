@@ -6,7 +6,7 @@ use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic_media_applet::manager::MediaSourceManager;
 use cosmic_media_applet::message::AppMessage;
 use cosmic_media_applet::mpris::{MediaEvent, PlaybackState, TrackInfo};
-use cosmic_media_applet::music_db::{AlbumInfo, SortMode, TrackStat};
+use cosmic_media_applet::music_db::{AlbumInfo, MusicStatsDb, SortMode, TrackStat};
 use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -38,6 +38,7 @@ pub struct MediaApplet {
     show_favorites_only: bool,
     sort_mode: SortMode,
     view_mode: ViewMode,
+    confirm_delete: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -67,9 +68,11 @@ pub enum Message {
     PopupClosed(iced_core_window::Id),
     Surface(cosmic::surface::Action<Message>),
     PlayTrack(String),
+    PlayAlbum(String),
     SetPosition(f32),
     SetVolume(f32),
     ToggleFavorite(String),
+    SetPlaylist(Vec<TrackStat>),
     SearchChanged(String),
     SelectAlbum(Option<String>),
     ToggleFavoritesOnly,
@@ -79,6 +82,9 @@ pub enum Message {
     LoadTracks,
     UpdateAlbums(Vec<AlbumInfo>),
     UpdateTracks(Vec<TrackStat>),
+    DeleteTrack(String),
+    ConfirmDelete(Option<String>),
+    CancelDelete,
 }
 
 impl MediaApplet {
@@ -194,6 +200,10 @@ impl std::fmt::Debug for Message {
                 .debug_struct("PlayTrack")
                 .field("path", &path)
                 .finish(),
+            Message::PlayAlbum(album) => f
+                .debug_struct("PlayAlbum")
+                .field("album", &album)
+                .finish(),
             Message::SetPosition(pos) => f
                 .debug_struct("SetPosition")
                 .field("position", pos)
@@ -205,6 +215,10 @@ impl std::fmt::Debug for Message {
             Message::ToggleFavorite(path) => f
                 .debug_struct("ToggleFavorite")
                 .field("path", &path)
+                .finish(),
+            Message::SetPlaylist(tracks) => f
+                .debug_struct("SetPlaylist")
+                .field("count", &tracks.len())
                 .finish(),
             Message::SearchChanged(query) => f
                 .debug_struct("SearchChanged")
@@ -227,6 +241,15 @@ impl std::fmt::Debug for Message {
                 .debug_struct("UpdateTracks")
                 .field("count", &tracks.len())
                 .finish(),
+            Message::DeleteTrack(path) => f
+                .debug_struct("DeleteTrack")
+                .field("path", &path)
+                .finish(),
+            Message::ConfirmDelete(path) => f
+                .debug_struct("ConfirmDelete")
+                .field("path", &path)
+                .finish(),
+            Message::CancelDelete => f.debug_struct("CancelDelete").finish(),
         }
     }
 }
@@ -309,6 +332,7 @@ impl cosmic::Application for MediaApplet {
                 show_favorites_only: false,
                 sort_mode: SortMode::PlayCountDesc,
                 view_mode: ViewMode::Albums,
+                confirm_delete: None,
             },
             cosmic::app::Task::perform(
                 async {
@@ -368,6 +392,9 @@ impl cosmic::Application for MediaApplet {
             }
             Message::ToggleFavorite(path) => {
                 self.route_command(move |m| async move { m.route(AppMessage::ToggleFavorite(path)).await })
+            }
+            Message::SetPlaylist(tracks) => {
+                self.route_command(move |m| async move { m.route(AppMessage::SetPlaylist(tracks)).await })
             }
             Message::ToggleSortMode => {
                 self.sort_mode = match self.sort_mode {
@@ -437,6 +464,30 @@ impl cosmic::Application for MediaApplet {
                 }
                 cosmic::app::Task::none()
             }
+            Message::PlayAlbum(album) => {
+                if let Some(ref manager) = self.manager {
+                    let m = manager.clone();
+                    let alb = album.clone();
+                    return cosmic::app::Task::perform(
+                        async move {
+                            let tracks = m.get_album_tracks(&alb).await?;
+                            m.route(AppMessage::SetPlaylist(tracks.clone())).await?;
+                            if let Some(first) = tracks.first() {
+                                m.route(AppMessage::PlayTrack(first.path.clone())).await?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        },
+                        |result| match result {
+                            Ok(_) => cosmic::Action::None,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "PlayAlbum failed");
+                                cosmic::Action::None
+                            }
+                        },
+                    );
+                }
+                cosmic::app::Task::none()
+            }
             Message::ToggleFavoritesOnly => {
                 self.show_favorites_only = !self.show_favorites_only;
                 if self.view_mode == ViewMode::Tracks && self.selected_album.is_none() {
@@ -479,6 +530,43 @@ impl cosmic::Application for MediaApplet {
                         },
                     );
                 }
+                cosmic::app::Task::none()
+            }
+            Message::DeleteTrack(path) => {
+                self.confirm_delete = Some(path);
+                cosmic::app::Task::none()
+            }
+            Message::ConfirmDelete(path_opt) => {
+                if let Some(ref do_delete) = path_opt {
+                    let do_delete = do_delete.clone();
+                    if let Some(ref manager) = self.manager {
+                        let m = manager.clone();
+                        return cosmic::app::Task::perform(
+                            async move {
+                                if let Some(_player) = m.player() {
+                                    let db = MusicStatsDb::new()?;
+                                    db.delete_track(&do_delete)?;
+                                }
+                                std::fs::remove_file(&do_delete).map_err(|e| {
+                                    anyhow::anyhow!("Failed to delete file: {}", e)
+                                })?;
+                                Ok::<(), anyhow::Error>(())
+                            },
+                            |result| match result {
+                                Ok(_) => cosmic::Action::App(Message::LoadAlbums),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Delete failed");
+                                    cosmic::Action::None
+                                }
+                            },
+                        );
+                    }
+                }
+                self.confirm_delete = None;
+                cosmic::app::Task::none()
+            }
+            Message::CancelDelete => {
+                self.confirm_delete = None;
                 cosmic::app::Task::none()
             }
             Message::ManagerReady(manager) => {
@@ -572,7 +660,13 @@ impl cosmic::Application for MediaApplet {
                 cosmic::app::Task::none()
             }
             Message::UpdateTracks(tracks) => {
-                self.tracks = tracks;
+                self.tracks = tracks.clone();
+                if !tracks.is_empty() {
+                    let task = cosmic::app::Task::done(cosmic::Action::App(
+                        Message::SetPlaylist(tracks),
+                    ));
+                    return task;
+                }
                 cosmic::app::Task::none()
             }
             Message::PopupClosed(id) => {
@@ -732,7 +826,8 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
         position_ratio,
         Message::SetPosition,
     )
-    .step(0.01);
+    .step(0.01_f32)
+    .width(cosmic::iced::Length::Fill);
 
     let progress_label = cosmic::widget::text(format!(
         "{} / {}",
@@ -746,7 +841,7 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
         Message::SetVolume,
     )
     .width(cosmic::iced::Length::Fixed(100.0))
-    .step(0.01);
+    .step(0.01_f32);
 
     let track_title = cosmic::widget::text(
         state.current_track_info.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
@@ -763,12 +858,23 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
     )
     .size(12);
 
+    let trash_btn = state
+        .core
+        .applet
+        .icon_button("user-trash-symbolic")
+        .on_press(Message::DeleteTrack(
+            state.current_track_info.as_ref()
+                .and_then(|t| t.file_path.clone())
+                .unwrap_or_default(),
+        ));
+
     let controls_row = cosmic::widget::Row::new()
         .push(prev_btn)
         .push(play_pause_btn)
         .push(next_btn)
         .push(stop_btn)
         .push(volume_slider)
+        .push(trash_btn)
         .spacing(12)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
@@ -803,14 +909,14 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
     let scan_btn = state
         .core
         .applet
-        .icon_button("folder-scan-symbolic")
+        .icon_button("view-refresh-symbolic")
         .on_press(Message::ScanMusic);
 
     let sort_icon = match state.sort_mode {
-        SortMode::NameAsc => "sort-alpha-asc-symbolic",
-        SortMode::NameDesc => "sort-alpha-desc-symbolic",
-        SortMode::PlayCountAsc => "sort-numeric-asc-symbolic",
-        SortMode::PlayCountDesc => "sort-numeric-desc-symbolic",
+        SortMode::NameAsc => "view-sort-ascending-symbolic",
+        SortMode::NameDesc => "view-sort-descending-symbolic",
+        SortMode::PlayCountAsc => "view-sort-ascending-symbolic",
+        SortMode::PlayCountDesc => "view-sort-descending-symbolic",
     };
     let sort_btn = state
         .core
@@ -819,8 +925,8 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
         .on_press(Message::ToggleSortMode);
 
     let view_icon = match state.view_mode {
-        ViewMode::Albums => "view-list-symbolic",
-        ViewMode::Tracks => "view-stream-symbolic",
+        ViewMode::Albums => "view-dual-symbolic",
+        ViewMode::Tracks => "view-list-symbolic",
     };
     let view_btn = state
         .core
@@ -857,7 +963,50 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
             .into()
     };
 
-    Element::from(cosmic::widget::scrollable(content).width(cosmic::iced::Length::Fill))
+    let final_content = if let Some(ref path_to_delete) = state.confirm_delete {
+        let title = state
+            .current_track_info
+            .as_ref()
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| path_to_delete.clone());
+        let dialog = cosmic::widget::Container::new(
+            cosmic::widget::Column::new()
+                .push(cosmic::widget::text("Delete this track?").size(16))
+                .push(cosmic::widget::text(title.clone()).size(12))
+                .push(
+                    cosmic::widget::Row::new()
+                        .push(
+                            state
+                                .core
+                                .applet
+                                .icon_button("dialog-ok-symbolic")
+                                .on_press(Message::ConfirmDelete(Some(path_to_delete.clone()))),
+                        )
+                        .push(
+                            state
+                                .core
+                                .applet
+                                .icon_button("dialog-cancel-symbolic")
+                                .on_press(Message::CancelDelete),
+                        )
+                        .spacing(12),
+                )
+                .spacing(8)
+                .padding(12),
+        )
+        .padding(12);
+
+        cosmic::widget::Container::new(dialog)
+            .width(cosmic::iced::Length::Fill)
+            .height(cosmic::iced::Length::Fill)
+            .center(cosmic::iced::Length::Fill)
+    } else {
+        cosmic::widget::Container::new(content)
+            .width(cosmic::iced::Length::Fill)
+            .height(cosmic::iced::Length::Fill)
+    };
+
+    Element::from(cosmic::widget::scrollable(final_content).width(cosmic::iced::Length::Fill))
 }
 
 fn albums_view(state: &MediaApplet) -> Element<'_, Message> {
@@ -869,10 +1018,16 @@ fn albums_view(state: &MediaApplet) -> Element<'_, Message> {
         );
     }
 
-    let album_rows: Vec<Element<'_, Message>> = state
+     let album_rows: Vec<Element<'_, Message>> = state
         .albums
         .iter()
         .map(|album_info| {
+            let album_name = album_info.album.clone();
+            let play_all_btn = state
+                .core
+                .applet
+                .icon_button("media-playback-start-symbolic")
+                .on_press(Message::PlayAlbum(album_name));
             let btn = state
                 .core
                 .applet
@@ -886,6 +1041,7 @@ fn albums_view(state: &MediaApplet) -> Element<'_, Message> {
             ))
             .size(12);
             cosmic::widget::Row::new()
+                .push(play_all_btn)
                 .push(btn)
                 .push(label)
                 .spacing(8)
@@ -944,8 +1100,21 @@ fn track_listing_view<'a>(state: &'a MediaApplet, album: &'a str) -> Element<'a,
         rows.push(cosmic::widget::text("No tracks found").size(12).into());
     }
 
-    let mut col = cosmic::widget::Column::new()
-        .push(cosmic::widget::Row::new().push(back_btn).push(cosmic::widget::text(album).size(14)))
+     let mut col = cosmic::widget::Column::new()
+        .push(
+            cosmic::widget::Row::new()
+                .push(back_btn)
+                .push(cosmic::widget::text(album).size(14))
+                .push(
+                    state
+                        .core
+                        .applet
+                        .icon_button("media-playback-start-symbolic")
+                        .on_press(Message::PlayAlbum(album.to_string()))
+                )
+                .spacing(8)
+                .align_y(cosmic::iced::alignment::Vertical::Center)
+        )
         .spacing(4);
     for row in rows {
         col = col.push(row);

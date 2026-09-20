@@ -106,6 +106,7 @@ impl MediaSourceManager {
                                         &cached_state_fwd,
                                         &cached_track_fwd,
                                         sender_for_task.clone(),
+                                        Some(&player_id),
                                     )
                                     .await;
                                 }
@@ -117,6 +118,7 @@ impl MediaSourceManager {
                                         &cached_state_fwd,
                                         &cached_track_fwd,
                                         sender_for_task.clone(),
+                                        Some(&player_id),
                                     )
                                     .await;
                                 }
@@ -368,6 +370,7 @@ impl MediaSourceManager {
                                         &cached_state_fwd,
                                         &cached_track_fwd,
                                         sender_for_task.clone(),
+                                        Some(&src_id),
                                     )
                                     .await;
                                 }
@@ -379,6 +382,7 @@ impl MediaSourceManager {
                                         &cached_state_fwd,
                                         &cached_track_fwd,
                                         sender_for_task.clone(),
+                                        Some(&src_id),
                                     )
                                     .await;
                                 }
@@ -464,6 +468,7 @@ impl MediaSourceManager {
         cached_state: &Arc<RwLock<PlaybackState>>,
         cached_track: &Arc<RwLock<Option<TrackInfo>>>,
         sender: broadcast::Sender<MediaEvent>,
+        priority_source_id: Option<&str>,
     ) {
         let sources = sources_lock.read().await.clone();
         let mut playing_idx: Option<usize> = None;
@@ -491,6 +496,18 @@ impl MediaSourceManager {
             .or(paused_idx)
             .and_then(|idx| sources.get(idx).cloned());
         let current_active = active_lock.read().await.clone();
+
+        let new_active = if new_active.is_none() {
+            let mut found: Option<Arc<dyn MediaSource>> = None;
+            if let Some(priority_id) = priority_source_id {
+                found = sources.iter().find(|s| s.id() == priority_id).cloned();
+            }
+            found
+                .or_else(|| sources.iter().find(|s| s.id() == crate::player::LOCAL_PLAYER_ID).cloned())
+                .or_else(|| sources.first().cloned())
+        } else {
+            new_active
+        };
 
         let new_active_id = new_active.as_ref().map(|s| s.id());
         let current_active_id = current_active.as_ref().map(|s| s.id());
@@ -532,6 +549,7 @@ impl MediaSourceManager {
             &self.cached_state,
             &self.cached_track,
             self.event_sender.clone(),
+            None,
         )
         .await;
     }
@@ -550,6 +568,12 @@ impl MediaSourceManager {
                     tracing::warn!("No local player available for PlayTrack");
                     Err(AppError::Mpris("Local player not available".to_string()).into())
                 }
+            }
+            AppMessage::SetPlaylist(tracks) => {
+                if let Some(ref player) = self.player {
+                    player.set_playlist(tracks).await;
+                }
+                Ok(())
             }
             AppMessage::ToggleFavorite(path) => {
                 if let Some(ref player) = self.player {

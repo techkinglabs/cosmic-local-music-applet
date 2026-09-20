@@ -1,4 +1,4 @@
-use rodio::{Decoder, Source};
+use rodio::Source;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -92,6 +92,7 @@ fn extract_tags(path: &Path) -> (String, String, String, u64) {
     let mut title = String::new();
     let artist = String::new();
     let mut album = String::new();
+
     let duration_ms = std::fs::File::open(path)
         .ok()
         .and_then(|f| rodio::Decoder::new(std::io::BufReader::new(f)).ok())
@@ -99,7 +100,27 @@ fn extract_tags(path: &Path) -> (String, String, String, u64) {
             let dur = src.total_duration();
             dur.map(|d| d.as_millis() as u64).unwrap_or(0)
         })
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            std::fs::File::open(path)
+                .ok()
+                .and_then(|f| {
+                    let mut decoder = minimp3::Decoder::new(std::io::BufReader::new(f));
+                    let mut total_samples = 0usize;
+                    let mut sample_rate = 0u32;
+                    let mut channels = 0u16;
+                    while let Ok(frame) = decoder.next_frame() {
+                        sample_rate = frame.sample_rate as u32;
+                        channels = frame.channels as u16;
+                        total_samples += frame.data.len();
+                    }
+                    if total_samples > 0 && sample_rate > 0 && channels > 0 {
+                        Some((total_samples as f64 / sample_rate as f64 / channels as f64 * 1000.0) as u64)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        });
 
     if title.is_empty() {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -170,6 +191,19 @@ impl MusicStatsDb {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_favorite ON tracks(is_favorite DESC, play_count DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS playback_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_path TEXT,
+                last_position_ms INTEGER NOT NULL DEFAULT 0,
+                last_state TEXT NOT NULL DEFAULT 'stopped'
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO playback_state (id, last_path, last_position_ms, last_state) VALUES (1, NULL, 0, 'stopped')",
             [],
         )?;
 
@@ -492,6 +526,14 @@ impl MusicStatsDb {
         Ok(())
     }
 
+    pub fn delete_track(&self, path: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM tracks WHERE path = ?1",
+            rusqlite::params![path],
+        )?;
+        Ok(())
+    }
+
     pub fn increment_play_count(&self, path: &str) -> anyhow::Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -525,6 +567,28 @@ impl MusicStatsDb {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             e => Err(anyhow::anyhow!(e)),
         })
+    }
+
+    pub fn save_playback_state(&self, path: Option<&str>, position_ms: u64, state: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO playback_state (id, last_path, last_position_ms, last_state) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![path, position_ms as i64, state],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_playback_state(&self) -> Option<(Option<String>, u64, String)> {
+        let row = self.conn.query_row(
+            "SELECT last_path, last_position_ms, last_state FROM playback_state WHERE id = 1",
+            [],
+            |row| {
+                let path: Option<String> = row.get(0)?;
+                let pos: i64 = row.get(1)?;
+                let state: String = row.get(2)?;
+                Ok((path, pos as u64, state))
+            },
+        ).ok()?;
+        Some(row)
     }
 }
 

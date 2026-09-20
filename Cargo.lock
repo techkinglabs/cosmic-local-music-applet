@@ -1089,6 +1089,7 @@ dependencies = [
  "async-trait",
  "futures",
  "libcosmic",
+ "minimp3",
  "rodio",
  "rusqlite",
  "thiserror 1.0.69",
@@ -3353,6 +3354,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minimp3"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82acfc4ecae15a73fc88d4f5f6ba6e2eece7ed980f1a63fccd1ae374c2a0b7c5"
+dependencies = [
+ "minimp3-sys",
+ "slice-ring-buffer",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "minimp3-sys"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa16a1fbac806d94e230e0a6b9b5a137d051897a188944cf07645da4b73a9fae"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4853,6 +4874,17 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slice-ring-buffer"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84ae312bda09b2368f79f985fdb4df4a0b5cbc75546b511303972d195f8c27d6"
+dependencies = [
+ "libc",
+ "mach2",
+ "winapi",
+]
 
 [[package]]
 name = "slotmap"

@@ -19,4 +19,6 @@ pub enum AppMessage {
     PlayTrack(String),
     /// Toggle favorite for a track
     ToggleFavorite(String),
+    /// Set the local player's playlist for next/previous navigation
+    SetPlaylist(Vec<crate::music_db::TrackStat>),
 }
