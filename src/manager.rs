@@ -1,7 +1,8 @@
 use crate::error::AppError;
 use crate::message::AppMessage;
 use crate::mpris::{MediaEvent, MediaSource, PlaybackState, TrackInfo};
-use crate::music_db::MusicStatsDb;
+use crate::music_db::{music_folder, MusicStatsDb};
+use crate::player::PlayerAdapter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,7 @@ pub struct MediaSourceManager {
     stats_album_count: Arc<RwLock<usize>>,
     stats_track_count: Arc<RwLock<usize>>,
     stats_last_scanned: Arc<RwLock<u64>>,
+    player: Option<Arc<PlayerAdapter>>,
 }
 
 impl MediaSourceManager {
@@ -46,6 +48,7 @@ impl MediaSourceManager {
             stats_album_count: Arc::new(RwLock::new(0)),
             stats_track_count: Arc::new(RwLock::new(0)),
             stats_last_scanned: Arc::new(RwLock::new(0)),
+            player: None,
         }
     }
 
@@ -60,6 +63,84 @@ impl MediaSourceManager {
         let cached_track: Arc<RwLock<Option<TrackInfo>>> = Arc::new(RwLock::new(None));
         let cached_state: Arc<RwLock<PlaybackState>> =
             Arc::new(RwLock::new(PlaybackState::Stopped));
+
+        let player = match PlayerAdapter::new() {
+            Ok(p) => {
+                tracing::info!("Local PlayerAdapter created");
+                Some(Arc::new(p))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create PlayerAdapter; local playback unavailable");
+                None
+            }
+        };
+
+        {
+            let mut sources_guard = sources.write().await;
+            if let Some(ref player) = player {
+                sources_guard.push(player.clone() as Arc<dyn MediaSource>);
+            }
+        }
+
+        if let Some(player) = player.as_ref() {
+            let player = player.clone();
+            let player_id = player.id().to_string();
+            let sender_clone = event_sender.clone();
+            let cached_track_fwd = cached_track.clone();
+            let cached_state_fwd = cached_state.clone();
+            let active_fwd = active_source.clone();
+            let sources_fwd = sources.clone();
+            let sender_for_task = event_sender.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut rx = player.subscribe();
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            match &event {
+                                MediaEvent::StateChanged(state) => {
+                                    *cached_state_fwd.write().await = state.clone();
+                                    Self::reselect_active_inner(
+                                        &sources_fwd,
+                                        &active_fwd,
+                                        &cached_state_fwd,
+                                        &cached_track_fwd,
+                                        sender_for_task.clone(),
+                                    )
+                                    .await;
+                                }
+                                MediaEvent::TrackChanged(track) => {
+                                    *cached_track_fwd.write().await = Some(track.clone());
+                                    Self::reselect_active_inner(
+                                        &sources_fwd,
+                                        &active_fwd,
+                                        &cached_state_fwd,
+                                        &cached_track_fwd,
+                                        sender_for_task.clone(),
+                                    )
+                                    .await;
+                                }
+                                MediaEvent::PlaybackPosition { .. } => {},
+                                MediaEvent::VolumeChanged(_) => {},
+                                MediaEvent::StatsUpdated { .. } => {},
+                                MediaEvent::SourceListChanged => {},
+                            }
+                            let _ = sender_clone.send(event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                source = %player_id,
+                                skipped,
+                                "Player event forwarder lagged; continuing"
+                            );
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            watch_handles.write().await.push(handle);
+        }
 
         let conn_clone = connection.clone();
         let sources_clone = sources.clone();
@@ -158,6 +239,7 @@ impl MediaSourceManager {
             stats_album_count,
             stats_track_count,
             stats_last_scanned,
+            player,
         })
     }
 
@@ -174,23 +256,30 @@ impl MediaSourceManager {
         let names = Self::list_mpris_names_static(conn).await;
         tracing::info!(count = names.len(), players = ?names, "MPRIS discovery result");
 
-        let mut new_sources: Vec<Arc<dyn MediaSource>> = Vec::new();
-        for bus_name in names {
-            match MprisAdapter::new(bus_name.clone(), conn.clone()).await {
-                Ok(adapter) => {
-                    tracing::info!(bus_name = %bus_name, display_name = %adapter.display_name(), "Created MPRIS adapter");
-                    new_sources.push(Arc::new(adapter) as Arc<dyn MediaSource>);
+        {
+            let mut sources_guard = sources_lock.write().await;
+            let existing_ids: std::collections::HashSet<String> =
+                sources_guard.iter().map(|s| s.id().to_string()).collect();
+            for bus_name in &names {
+                if !existing_ids.contains(&format!("mpris:{}", bus_name)) {
+                    match MprisAdapter::new(bus_name.clone(), conn.clone()).await {
+                        Ok(adapter) => {
+                            tracing::info!(bus_name = %bus_name, display_name = %adapter.display_name(), "Created MPRIS adapter");
+                            sources_guard.push(Arc::new(adapter) as Arc<dyn MediaSource>);
+                        }
+                        Err(e) => tracing::warn!(bus_name=%bus_name, error=%e, "Failed to create adapter"),
+                    }
                 }
-                Err(e) => tracing::warn!(bus_name=%bus_name, error=%e, "Failed to create adapter"),
             }
         }
 
         let mut playing_idx: Option<usize> = None;
         let mut paused_idx: Option<usize> = None;
-        let mut cached_states: Vec<PlaybackState> = Vec::with_capacity(new_sources.len());
-        let mut cached_tracks: Vec<Option<TrackInfo>> = Vec::with_capacity(new_sources.len());
+        let mut cached_states: Vec<PlaybackState> = Vec::new();
+        let mut cached_tracks: Vec<Option<TrackInfo>> = Vec::new();
 
-        for (i, src) in new_sources.iter().enumerate() {
+        let sources_snapshot = sources_lock.read().await.clone();
+        for (i, src) in sources_snapshot.iter().enumerate() {
             let state = match timeout(MPRIS_CALL_TIMEOUT, src.get_state()).await {
                 Ok(s) => s,
                 Err(_) => {
@@ -207,7 +296,7 @@ impl MediaSourceManager {
             };
             cached_states.push(state.clone());
             cached_tracks.push(track.clone());
-            tracing::debug!(index = i, source = %src.display_name(), ?state, has_track = track.is_some(), "Cached MPRIS source state");
+            tracing::debug!(index = i, source = %src.display_name(), ?state, has_track = track.is_some(), "Cached source state");
             match state {
                 PlaybackState::Playing if playing_idx.is_none() => playing_idx = Some(i),
                 PlaybackState::Paused if paused_idx.is_none() => paused_idx = Some(i),
@@ -220,10 +309,9 @@ impl MediaSourceManager {
 
         let new_active = playing_idx
             .or(paused_idx)
-            .and_then(|idx| new_sources.get(idx).cloned());
-        tracing::info!(active = ?new_active.as_ref().map(|source| source.display_name()), "Selected active MPRIS source");
+            .and_then(|idx| sources_snapshot.get(idx).cloned());
+        tracing::info!(active = ?new_active.as_ref().map(|source| source.display_name()), "Selected active source");
 
-        *sources_lock.write().await = new_sources;
         *active_lock.write().await = new_active.clone();
 
         if let Some(_active) = new_active {
@@ -247,9 +335,13 @@ impl MediaSourceManager {
 
         let _ = sender.send(MediaEvent::SourceListChanged);
 
+        let mut old_handles = watch_handles.write().await;
+        for handle in old_handles.drain(..) {
+            handle.abort();
+        }
+        tracing::debug!(count = sources_snapshot.len(), "Installed source event forwarders");
         let mut handles = Vec::new();
-        let sources: Vec<Arc<dyn MediaSource>> = sources_lock.read().await.clone();
-        for src in sources.iter().cloned() {
+        for src in sources_snapshot.iter().cloned() {
             let sender_clone = sender.clone();
             let src_id = src.id().to_string();
             let cached_track_fwd = cached_track.clone();
@@ -292,6 +384,8 @@ impl MediaSourceManager {
                                 }
                                 MediaEvent::SourceListChanged => {},
                                 MediaEvent::StatsUpdated { .. } => {},
+                                MediaEvent::PlaybackPosition { .. } => {},
+                                MediaEvent::VolumeChanged(_) => {},
                             }
                             let _ = sender_clone.send(event);
                         }
@@ -299,7 +393,7 @@ impl MediaSourceManager {
                             tracing::warn!(
                                 source = %src_id,
                                 skipped,
-                                "Adapter event forwarder lagged; continuing"
+                                "Source event forwarder lagged; continuing"
                             );
                             continue;
                         }
@@ -309,12 +403,6 @@ impl MediaSourceManager {
             });
             handles.push(handle);
         }
-
-        let mut old_handles = watch_handles.write().await;
-        for handle in old_handles.drain(..) {
-            handle.abort();
-        }
-        tracing::debug!(count = handles.len(), "Installed MPRIS event forwarders");
         *old_handles = handles;
     }
 
@@ -410,7 +498,7 @@ impl MediaSourceManager {
 
         if new_active_id != current_active_id {
             *active_lock.write().await = new_active.clone();
-            tracing::info!(source = ?new_active.as_ref().map(|source| source.display_name()), "Active MPRIS source changed");
+            tracing::info!(source = ?new_active.as_ref().map(|source| source.display_name()), "Active source changed");
             if let Some(src) = new_active {
                 let state = match timeout(MPRIS_CALL_TIMEOUT, src.get_state()).await {
                     Ok(s) => s,
@@ -437,7 +525,7 @@ impl MediaSourceManager {
     }
 
     pub async fn reselect_active(&self) {
-        tracing::debug!("Re-evaluating active MPRIS source");
+        tracing::debug!("Re-evaluating active source");
         Self::reselect_active_inner(
             &self.sources,
             &self.active_source,
@@ -453,6 +541,23 @@ impl MediaSourceManager {
             AppMessage::ScanMusic => {
                 tracing::info!("ScanMusic requested");
                 self.scan_music().await
+            }
+            AppMessage::PlayTrack(path) => {
+                if let Some(ref player) = self.player {
+                    tracing::info!(path = %path, "Playing local track");
+                    player.play_track(&path).await
+                } else {
+                    tracing::warn!("No local player available for PlayTrack");
+                    Err(AppError::Mpris("Local player not available".to_string()).into())
+                }
+            }
+            AppMessage::ToggleFavorite(path) => {
+                if let Some(ref player) = self.player {
+                    player.toggle_favorite(&path).await
+                } else {
+                    let db = MusicStatsDb::new()?;
+                    db.toggle_favorite(&path)
+                }
             }
             AppMessage::Previous => {
                 let active = self.active_source.read().await.clone();
@@ -478,6 +583,30 @@ impl MediaSourceManager {
                 self.log_command_result(&result, &source, &cmd);
                 result
             }
+            AppMessage::Stop => {
+                let active = self.active_source.read().await.clone();
+                let source = active.ok_or_else(|| AppError::NoActiveSource)?;
+                tracing::info!(source = %source.display_name(), command = ?cmd, "Routing media command");
+                let result = source.stop().await;
+                self.log_command_result(&result, &source, &cmd);
+                result
+            }
+            AppMessage::SetPosition(pos_ms) => {
+                let active = self.active_source.read().await.clone();
+                let source = active.ok_or_else(|| AppError::NoActiveSource)?;
+                tracing::info!(source = %source.display_name(), pos_ms, "Routing set position command");
+                let result = source.set_position(pos_ms).await;
+                self.log_command_result(&result, &source, &cmd);
+                result
+            }
+            AppMessage::SetVolume(vol) => {
+                let active = self.active_source.read().await.clone();
+                let source = active.ok_or_else(|| AppError::NoActiveSource)?;
+                tracing::info!(source = %source.display_name(), volume = vol, "Routing set volume command");
+                let result = source.set_volume(vol).await;
+                self.log_command_result(&result, &source, &cmd);
+                result
+            }
         }
     }
 
@@ -490,7 +619,7 @@ impl MediaSourceManager {
 
     pub async fn scan_music(&self) -> anyhow::Result<()> {
         tracing::info!("Starting music folder scan");
-        let music_dir = MusicStatsDb::music_folder();
+        let music_dir = music_folder();
         let _db_path = self
             .db_path
             .clone()
@@ -615,6 +744,46 @@ impl MediaSourceManager {
             .unwrap_or(PlaybackState::Stopped);
         tracing::debug!(track = ?track, state = ?state, "Read cached state");
         (track, state)
+    }
+
+    pub fn player(&self) -> Option<Arc<PlayerAdapter>> {
+        self.player.clone()
+    }
+
+    pub async fn all_tracks(&self) -> anyhow::Result<Vec<crate::music_db::TrackStat>> {
+        if let Some(ref player) = self.player {
+            player.all_tracks().await
+        } else {
+            let db = MusicStatsDb::new()?;
+            db.get_tracks_sorted_by_play_count()
+        }
+    }
+
+    pub async fn search_tracks(&self, query: &str) -> anyhow::Result<Vec<crate::music_db::TrackStat>> {
+        if let Some(ref player) = self.player {
+            player.search(query).await
+        } else {
+            let db = MusicStatsDb::new()?;
+            db.search_tracks(query)
+        }
+    }
+
+    pub async fn get_albums(&self) -> anyhow::Result<Vec<crate::music_db::AlbumInfo>> {
+        if let Some(ref player) = self.player {
+            player.get_albums().await
+        } else {
+            let db = MusicStatsDb::new()?;
+            db.get_albums()
+        }
+    }
+
+    pub async fn get_album_tracks(&self, album: &str) -> anyhow::Result<Vec<crate::music_db::TrackStat>> {
+        if let Some(ref player) = self.player {
+            player.get_album_tracks(album).await
+        } else {
+            let db = MusicStatsDb::new()?;
+            db.get_tracks_in_album(album)
+        }
     }
 }
 

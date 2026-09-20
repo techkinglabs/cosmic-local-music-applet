@@ -17,8 +17,39 @@ pub struct TrackInfo {
     pub artist: String,
     /// Track album
     pub album: Option<String>,
-    /// Unique source identifier (e.g., "chrome.instance123")
+    /// Unique source identifier (e.g., "chrome.instance123", "local-player")
     pub source_id: String,
+    /// Track duration in milliseconds
+    pub duration_ms: Option<u64>,
+    /// Absolute file path for local tracks (None for MPRIS sources)
+    pub file_path: Option<String>,
+}
+
+impl TrackInfo {
+    /// Creates a new `TrackInfo` with default values
+    pub fn new(title: String, artist: String, album: Option<String>, source_id: String) -> Self {
+        Self {
+            title,
+            artist,
+            album,
+            source_id,
+            duration_ms: None,
+            file_path: None,
+        }
+    }
+}
+
+impl Default for TrackInfo {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            artist: String::new(),
+            album: None,
+            source_id: String::new(),
+            duration_ms: None,
+            file_path: None,
+        }
+    }
 }
 
 impl fmt::Display for TrackInfo {
@@ -35,7 +66,7 @@ impl fmt::Display for TrackInfo {
 }
 
 /// Playback state of a media source.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackState {
     /// Track is currently playing
     Playing,
@@ -63,14 +94,23 @@ pub enum MediaEvent {
         /// Unix timestamp of last scan
         last_scanned: u64,
     },
+    /// Playback position update (position_ms, duration_ms)
+    PlaybackPosition {
+        /// Current position in milliseconds
+        position_ms: u64,
+        /// Total duration in milliseconds
+        duration_ms: u64,
+    },
+    /// Volume changed (0.0 to 1.0)
+    VolumeChanged(f32),
 }
 
-/// Trait for media sources that can be controlled via MPRIS2.
+/// Trait for media sources that can be controlled via MPRIS2 or local playback.
 #[async_trait]
 pub trait MediaSource: Send + Sync {
     /// Unique identifier for this source
     fn id(&self) -> &str;
-    /// Display name (e.g., "Brave", "VLC")
+    /// Display name (e.g., "Brave", "VLC", "Local Music")
     fn display_name(&self) -> &str;
     /// Check if this source is currently available
     async fn is_available(&self) -> bool;
@@ -84,6 +124,16 @@ pub trait MediaSource: Send + Sync {
     async fn next(&self) -> anyhow::Result<()>;
     /// Go to previous track
     async fn previous(&self) -> anyhow::Result<()>;
+    /// Stop playback
+    async fn stop(&self) -> anyhow::Result<()>;
+    /// Set playback position (milliseconds)
+    async fn set_position(&self, position_ms: u64) -> anyhow::Result<()>;
+    /// Set volume (0.0 to 1.0)
+    async fn set_volume(&self, volume: f32) -> anyhow::Result<()>;
+    /// Get current playback position (milliseconds)
+    async fn get_position(&self) -> Option<u64>;
+    /// Get current volume (0.0 to 1.0)
+    async fn get_volume(&self) -> Option<f32>;
     /// Subscribe to media events
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<MediaEvent>;
 }

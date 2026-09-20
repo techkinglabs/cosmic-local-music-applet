@@ -183,6 +183,19 @@ impl MprisAdapter {
         let album = metadata
             .get("xesam:album")
             .and_then(|v| Self::extract_string(v));
+        let duration_ms = metadata
+            .get("mpris:length")
+            .and_then(|v| {
+                let inner = match v {
+                    Value::Value(iv) => iv,
+                    other => other,
+                };
+                match inner {
+                    Value::U64(n) => Some(*n / 1_000_000),
+                    Value::I64(n) => Some((*n as u64) / 1_000_000),
+                    _ => Self::extract_string(inner).and_then(|s| s.parse::<u64>().ok()).map(|n| n / 1_000_000),
+                }
+            });
         if title.is_empty() && artist.is_empty() {
             return None;
         }
@@ -191,6 +204,8 @@ impl MprisAdapter {
             artist,
             album,
             source_id: source_id.to_string(),
+            duration_ms,
+            file_path: None,
         })
     }
 }
@@ -244,6 +259,7 @@ impl MediaSource for MprisAdapter {
                 self.track.lock().unwrap_or_else(|e| e.into_inner()).clone()
             })?;
         t.source_id = self.source_id.clone();
+        t.file_path = None;
         tracing::debug!(bus_name = %self.bus_name, title = %t.title, "get_track: returning track");
         Some(t)
     }
@@ -306,6 +322,62 @@ impl MediaSource for MprisAdapter {
         p.call::<&str, (), ()>("Previous", &()).await?;
         Ok(())
     }
+    async fn stop(&self) -> anyhow::Result<()> {
+        let p = Proxy::new(
+            &self.connection,
+            self.bus_name.as_str(),
+            MPRIS_PATH,
+            MPRIS_INTERFACE,
+        )
+        .await?;
+        p.call::<&str, (), ()>("Stop", &()).await?;
+        Ok(())
+    }
+    async fn set_position(&self, position_ms: u64) -> anyhow::Result<()> {
+        let p = Proxy::new(
+            &self.connection,
+            self.bus_name.as_str(),
+            MPRIS_PATH,
+            MPRIS_INTERFACE,
+        )
+        .await?;
+        let position_us = position_ms * 1000;
+        p.call::<&str, (u64,), ()>("SetPosition", &(position_us,)).await?;
+        Ok(())
+    }
+    async fn set_volume(&self, volume: f32) -> anyhow::Result<()> {
+        let p = Proxy::new(
+            &self.connection,
+            self.bus_name.as_str(),
+            MPRIS_PATH,
+            MPRIS_INTERFACE,
+        )
+        .await?;
+        p.set_property("Volume", &(volume as f64)).await?;
+        Ok(())
+    }
+    async fn get_position(&self) -> Option<u64> {
+        let proxy = Proxy::new(
+            &self.connection,
+            self.bus_name.as_str(),
+            MPRIS_PATH,
+            MPRIS_INTERFACE,
+        )
+        .await
+        .ok()?;
+        proxy.get_property::<u64>("Position").await.ok().map(|us| us / 1000)
+    }
+    async fn get_volume(&self) -> Option<f32> {
+        let proxy = Proxy::new(
+            &self.connection,
+            self.bus_name.as_str(),
+            MPRIS_PATH,
+            MPRIS_INTERFACE,
+        )
+        .await
+        .ok()?;
+        proxy.get_property::<f64>("Volume").await.ok().map(|v| v as f32)
+    }
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<MediaEvent> {
         self.event_sender.subscribe()
     }
@@ -363,6 +435,7 @@ mod tests {
         assert_eq!(track.artist, "Queen");
         assert_eq!(track.album, Some("A Night at the Opera".to_string()));
         assert_eq!(track.source_id, "test_source");
+        assert_eq!(track.file_path, None);
     }
 
     #[test]
