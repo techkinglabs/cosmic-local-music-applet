@@ -6,7 +6,7 @@
 
 pub use self::message::AppMessage;
 pub use self::mpris::{MediaEvent, MediaSource, MprisAdapter, PlaybackState, TrackInfo};
-pub use self::music_db::{AlbumInfo, MusicStats, MusicStatsDb, TrackStat};
+pub use self::music_db::{AlbumInfo, MusicStats, MusicStatsDb, SortMode, TrackStat};
 pub use self::player::PlayerAdapter;
 
 /// Media source trait for controlling playback.

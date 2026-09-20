@@ -98,7 +98,12 @@ impl PlayerAdapter {
         let source = Decoder::new(std::io::BufReader::new(file))
             .map_err(|e| anyhow::anyhow!("Failed to decode audio: {}", e))?;
 
-        let duration_ms = track_stat.as_ref().map(|s| s.duration_ms).unwrap_or(0);
+        let source_duration_ms = source.total_duration()
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let db_duration_ms = track_stat.as_ref().map(|s| s.duration_ms).unwrap_or(0);
+        let duration_ms = if db_duration_ms > 0 { db_duration_ms } else { source_duration_ms };
 
         let track_info = TrackInfo {
             title: track_stat.as_ref().map(|s| s.title.clone()).unwrap_or_else(|| {
@@ -246,6 +251,11 @@ impl PlayerAdapter {
         db.get_albums()
     }
 
+    pub async fn get_albums_sorted(&self, sort_mode: crate::music_db::SortMode) -> Result<Vec<crate::music_db::AlbumInfo>> {
+        let db = MusicStatsDb::new()?;
+        db.get_albums_sorted(sort_mode)
+    }
+
     pub async fn get_album_tracks(&self, album: &str) -> Result<Vec<TrackStat>> {
         let db = MusicStatsDb::new()?;
         db.get_tracks_in_album(album)
@@ -265,6 +275,11 @@ impl PlayerAdapter {
     pub async fn all_tracks(&self) -> Result<Vec<TrackStat>> {
         let db = MusicStatsDb::new()?;
         db.get_tracks_sorted_by_play_count()
+    }
+
+    pub async fn all_tracks_sorted(&self, sort_mode: crate::music_db::SortMode) -> Result<Vec<TrackStat>> {
+        let db = MusicStatsDb::new()?;
+        db.get_tracks_sorted(sort_mode)
     }
 
     pub fn music_folder(&self) -> &std::path::Path {
@@ -370,41 +385,43 @@ impl MediaSource for PlayerAdapter {
         let track = self.current_track.lock().unwrap().clone();
         if let Some(ref t) = track {
             if let Some(ref path) = t.file_path {
+                let skip = std::time::Duration::from_millis(position_ms);
+
+                {
+                    let sink_guard = self.sink.lock().unwrap();
+                    if let Some(s) = sink_guard.as_ref() {
+                        s.stop();
+                        s.clear();
+                    }
+                }
+
                 let file = std::fs::File::open(path)?;
                 let new_source = Decoder::new(std::io::BufReader::new(file))?;
-
-                let skip = std::time::Duration::from_millis(position_ms);
                 let seeked_source = new_source.skip_duration(skip);
 
-                let stream_handle_opt = self._stream_handle.lock().unwrap().take();
                 let volume = *self.volume.lock().unwrap();
+                let stream_handle = {
+                    let sh_guard = self._stream_handle.lock().unwrap();
+                    sh_guard.clone()
+                };
 
-                let (new_sink, wrapped_stream, new_stream_handle) = {
-                    let (new_stream, new_stream_handle) = if let Some(sh) = stream_handle_opt {
-                        (None, sh)
-                    } else {
-                        let (s, sh) = OutputStream::try_default()?;
-                        (Some(SendableOutputStream(s)), sh)
-                    };
-                    let new_sink = Sink::try_new(&new_stream_handle)
+                if let Some(sh) = stream_handle {
+                    let new_sink = Sink::try_new(&sh)
                         .map_err(|e| anyhow::anyhow!("Failed to create sink: {}", e))?;
                     new_sink.set_volume(volume);
                     new_sink.append(seeked_source);
                     new_sink.play();
-                    (new_sink, new_stream, new_stream_handle)
-                };
-
-                {
-                    let mut sink_guard = self.sink.lock().unwrap();
-                    *sink_guard = Some(new_sink);
-                }
-                {
-                    let mut stream_guard = self._stream.lock().unwrap();
-                    *stream_guard = wrapped_stream;
-                }
-                {
-                    let mut sh_guard = self._stream_handle.lock().unwrap();
-                    *sh_guard = Some(new_stream_handle);
+                    *self.sink.lock().unwrap() = Some(new_sink);
+                } else {
+                    let (_stream, stream_handle) = OutputStream::try_default()?;
+                    let new_sink = Sink::try_new(&stream_handle)
+                        .map_err(|e| anyhow::anyhow!("Failed to create sink: {}", e))?;
+                    new_sink.set_volume(volume);
+                    new_sink.append(seeked_source);
+                    new_sink.play();
+                    *self._stream.lock().unwrap() = Some(SendableOutputStream(_stream));
+                    *self._stream_handle.lock().unwrap() = Some(stream_handle);
+                    *self.sink.lock().unwrap() = Some(new_sink);
                 }
 
                 *self.position_start.lock().unwrap() = Some(std::time::Instant::now() - skip);

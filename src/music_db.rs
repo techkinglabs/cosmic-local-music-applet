@@ -1,3 +1,4 @@
+use rodio::{Decoder, Source};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +53,14 @@ fn _db_path() -> PathBuf {
     data_home().join("cosmic-media-applet").join("music_stats.db")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortMode {
+    NameAsc,
+    NameDesc,
+    PlayCountAsc,
+    PlayCountDesc,
+}
+
 pub fn music_folder() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
@@ -83,7 +92,14 @@ fn extract_tags(path: &Path) -> (String, String, String, u64) {
     let mut title = String::new();
     let artist = String::new();
     let mut album = String::new();
-    let duration_ms = 0u64;
+    let duration_ms = std::fs::File::open(path)
+        .ok()
+        .and_then(|f| rodio::Decoder::new(std::io::BufReader::new(f)).ok())
+        .map(|src| {
+            let dur = src.total_duration();
+            dur.map(|d| d.as_millis() as u64).unwrap_or(0)
+        })
+        .unwrap_or(0);
 
     if title.is_empty() {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -323,6 +339,38 @@ impl MusicStatsDb {
         Ok(tracks)
     }
 
+    pub fn get_tracks_sorted(&self, sort_mode: SortMode) -> anyhow::Result<Vec<TrackStat>> {
+        let order = match sort_mode {
+            SortMode::NameAsc => "ORDER BY title ASC",
+            SortMode::NameDesc => "ORDER BY title DESC",
+            SortMode::PlayCountAsc => "ORDER BY play_count ASC, title ASC",
+            SortMode::PlayCountDesc => "ORDER BY play_count DESC, title ASC",
+        };
+        let sql = format!(
+            "SELECT path, title, artist, album, duration_ms, play_count, is_favorite, last_played
+             FROM tracks {}",
+            order
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TrackStat {
+                path: row.get::<_, String>(0)?,
+                title: row.get::<_, String>(1)?,
+                artist: row.get::<_, String>(2)?,
+                album: row.get::<_, String>(3)?,
+                duration_ms: row.get::<_, i64>(4)? as u64,
+                play_count: row.get::<_, i64>(5)? as u64,
+                is_favorite: row.get::<_, i64>(6)? != 0,
+                last_played: row.get::<_, i64>(7)? as u64,
+            })
+        })?;
+        let mut tracks = Vec::new();
+        for row in rows {
+            tracks.push(row?);
+        }
+        Ok(tracks)
+    }
+
     pub fn search_tracks(&self, query: &str) -> anyhow::Result<Vec<TrackStat>> {
         let pattern = format!("%{}%", query.to_lowercase());
         let mut stmt = self.conn.prepare(
@@ -351,12 +399,24 @@ impl MusicStatsDb {
     }
 
     pub fn get_albums(&self) -> anyhow::Result<Vec<AlbumInfo>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT album, artist, COUNT(*) as cnt
+        self.get_albums_sorted(SortMode::NameAsc)
+    }
+
+    pub fn get_albums_sorted(&self, sort_mode: SortMode) -> anyhow::Result<Vec<AlbumInfo>> {
+        let order = match sort_mode {
+            SortMode::NameAsc => "ORDER BY album ASC",
+            SortMode::NameDesc => "ORDER BY album DESC",
+            SortMode::PlayCountAsc => "ORDER BY total_play_count ASC, album ASC",
+            SortMode::PlayCountDesc => "ORDER BY total_play_count DESC, album ASC",
+        };
+        let sql = format!(
+            "SELECT album, artist, COUNT(*) as cnt, COALESCE(SUM(play_count), 0) as total_play_count
              FROM tracks
              GROUP BY album, artist
-             ORDER BY album ASC"
-        )?;
+             {}",
+            order
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(AlbumInfo {
                 album: row.get::<_, String>(0)?,

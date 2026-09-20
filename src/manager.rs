@@ -751,11 +751,15 @@ impl MediaSourceManager {
     }
 
     pub async fn all_tracks(&self) -> anyhow::Result<Vec<crate::music_db::TrackStat>> {
+        self.all_tracks_sorted(crate::music_db::SortMode::PlayCountDesc).await
+    }
+
+    pub async fn all_tracks_sorted(&self, sort_mode: crate::music_db::SortMode) -> anyhow::Result<Vec<crate::music_db::TrackStat>> {
         if let Some(ref player) = self.player {
-            player.all_tracks().await
+            player.all_tracks_sorted(sort_mode).await
         } else {
             let db = MusicStatsDb::new()?;
-            db.get_tracks_sorted_by_play_count()
+            db.get_tracks_sorted(sort_mode)
         }
     }
 
@@ -769,11 +773,15 @@ impl MediaSourceManager {
     }
 
     pub async fn get_albums(&self) -> anyhow::Result<Vec<crate::music_db::AlbumInfo>> {
+        self.get_albums_sorted(crate::music_db::SortMode::NameAsc).await
+    }
+
+    pub async fn get_albums_sorted(&self, sort_mode: crate::music_db::SortMode) -> anyhow::Result<Vec<crate::music_db::AlbumInfo>> {
         if let Some(ref player) = self.player {
-            player.get_albums().await
+            player.get_albums_sorted(sort_mode).await
         } else {
             let db = MusicStatsDb::new()?;
-            db.get_albums()
+            db.get_albums_sorted(sort_mode)
         }
     }
 

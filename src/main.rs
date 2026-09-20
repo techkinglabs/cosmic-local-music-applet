@@ -6,7 +6,7 @@ use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic_media_applet::manager::MediaSourceManager;
 use cosmic_media_applet::message::AppMessage;
 use cosmic_media_applet::mpris::{MediaEvent, PlaybackState, TrackInfo};
-use cosmic_media_applet::music_db::{AlbumInfo, TrackStat};
+use cosmic_media_applet::music_db::{AlbumInfo, SortMode, TrackStat};
 use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -36,6 +36,14 @@ pub struct MediaApplet {
     search_query: String,
     selected_album: Option<String>,
     show_favorites_only: bool,
+    sort_mode: SortMode,
+    view_mode: ViewMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ViewMode {
+    Albums,
+    Tracks,
 }
 
 #[derive(Clone)]
@@ -65,6 +73,8 @@ pub enum Message {
     SearchChanged(String),
     SelectAlbum(Option<String>),
     ToggleFavoritesOnly,
+    ToggleSortMode,
+    ToggleViewMode,
     LoadAlbums,
     LoadTracks,
     UpdateAlbums(Vec<AlbumInfo>),
@@ -205,6 +215,8 @@ impl std::fmt::Debug for Message {
                 .field("album", album)
                 .finish(),
             Message::ToggleFavoritesOnly => f.debug_struct("ToggleFavoritesOnly").finish(),
+            Message::ToggleSortMode => f.debug_struct("ToggleSortMode").finish(),
+            Message::ToggleViewMode => f.debug_struct("ToggleViewMode").finish(),
             Message::LoadAlbums => f.debug_struct("LoadAlbums").finish(),
             Message::LoadTracks => f.debug_struct("LoadTracks").finish(),
             Message::UpdateAlbums(albums) => f
@@ -295,6 +307,8 @@ impl cosmic::Application for MediaApplet {
                 search_query: String::new(),
                 selected_album: None,
                 show_favorites_only: false,
+                sort_mode: SortMode::PlayCountDesc,
+                view_mode: ViewMode::Albums,
             },
             cosmic::app::Task::perform(
                 async {
@@ -323,7 +337,22 @@ impl cosmic::Application for MediaApplet {
             Message::PlayPause => self.route_command(|m| async move { m.route(AppMessage::PlayPause).await }),
             Message::Next => self.route_command(|m| async move { m.route(AppMessage::Next).await }),
             Message::Stop => self.route_command(|m| async move { m.route(AppMessage::Stop).await }),
-            Message::ScanMusic => self.route_command(|m| async move { m.route(AppMessage::ScanMusic).await }),
+            Message::ScanMusic => {
+                if let Some(ref manager) = self.manager {
+                    let m = manager.clone();
+                    return cosmic::app::Task::perform(
+                        async move { m.route(AppMessage::ScanMusic).await },
+                        |result| match result {
+                            Ok(_) => cosmic::Action::App(Message::LoadAlbums),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Scan failed");
+                                cosmic::Action::None
+                            }
+                        },
+                    );
+                }
+                cosmic::app::Task::none()
+            }
             Message::PlayTrack(path) => {
                 self.route_command(move |m| async move { m.route(AppMessage::PlayTrack(path)).await })
             }
@@ -339,6 +368,31 @@ impl cosmic::Application for MediaApplet {
             }
             Message::ToggleFavorite(path) => {
                 self.route_command(move |m| async move { m.route(AppMessage::ToggleFavorite(path)).await })
+            }
+            Message::ToggleSortMode => {
+                self.sort_mode = match self.sort_mode {
+                    SortMode::NameAsc => SortMode::NameDesc,
+                    SortMode::NameDesc => SortMode::PlayCountAsc,
+                    SortMode::PlayCountAsc => SortMode::PlayCountDesc,
+                    SortMode::PlayCountDesc => SortMode::NameAsc,
+                };
+                if self.view_mode == ViewMode::Tracks && self.selected_album.is_none() {
+                    cosmic::app::Task::perform(async move {}, |_| cosmic::Action::App(Message::LoadTracks))
+                } else {
+                    cosmic::app::Task::perform(async move {}, |_| cosmic::Action::App(Message::LoadAlbums))
+                }
+            }
+            Message::ToggleViewMode => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Albums => ViewMode::Tracks,
+                    ViewMode::Tracks => ViewMode::Albums,
+                };
+                self.selected_album = None;
+                if self.view_mode == ViewMode::Tracks {
+                    cosmic::app::Task::perform(async move {}, |_| cosmic::Action::App(Message::LoadTracks))
+                } else {
+                    cosmic::app::Task::perform(async move {}, |_| cosmic::Action::App(Message::LoadAlbums))
+                }
             }
             Message::SearchChanged(query) => {
                 self.search_query = query;
@@ -385,13 +439,20 @@ impl cosmic::Application for MediaApplet {
             }
             Message::ToggleFavoritesOnly => {
                 self.show_favorites_only = !self.show_favorites_only;
-                cosmic::app::Task::none()
+                if self.view_mode == ViewMode::Tracks && self.selected_album.is_none() {
+                    cosmic::app::Task::perform(async move {}, |_| cosmic::Action::App(Message::LoadTracks))
+                } else if self.view_mode == ViewMode::Albums {
+                    cosmic::app::Task::perform(async move {}, |_| cosmic::Action::App(Message::LoadAlbums))
+                } else {
+                    cosmic::app::Task::none()
+                }
             }
             Message::LoadAlbums => {
                 if let Some(ref manager) = self.manager {
                     let m = manager.clone();
+                    let sort_mode = self.sort_mode;
                     return cosmic::app::Task::perform(
-                        async move { m.get_albums().await },
+                        async move { m.get_albums_sorted(sort_mode).await },
                         |result| match result {
                             Ok(albums) => cosmic::Action::App(Message::UpdateAlbums(albums)),
                             Err(e) => {
@@ -406,8 +467,9 @@ impl cosmic::Application for MediaApplet {
             Message::LoadTracks => {
                 if let Some(ref manager) = self.manager {
                     let m = manager.clone();
+                    let sort_mode = self.sort_mode;
                     return cosmic::app::Task::perform(
-                        async move { m.all_tracks().await },
+                        async move { m.all_tracks_sorted(sort_mode).await },
                         |result| match result {
                             Ok(tracks) => cosmic::Action::App(Message::UpdateTracks(tracks)),
                             Err(e) => {
@@ -432,7 +494,7 @@ impl cosmic::Application for MediaApplet {
                 self.stats_last_scanned = ts;
 
                 return cosmic::app::Task::perform(
-                    async move { manager.get_albums().await },
+                    async move { manager.get_albums_sorted(SortMode::PlayCountDesc).await },
                     |result| match result {
                         Ok(albums) => cosmic::Action::App(Message::UpdateAlbums(albums)),
                         Err(e) => {
@@ -669,7 +731,8 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
         0.0..=1.0,
         position_ratio,
         Message::SetPosition,
-    );
+    )
+    .step(0.01);
 
     let progress_label = cosmic::widget::text(format!(
         "{} / {}",
@@ -682,7 +745,8 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
         state.current_volume,
         Message::SetVolume,
     )
-    .width(cosmic::iced::Length::Fixed(80.0));
+    .width(cosmic::iced::Length::Fixed(100.0))
+    .step(0.01);
 
     let track_title = cosmic::widget::text(
         state.current_track_info.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
@@ -736,9 +800,40 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
         })
         .on_press(Message::ToggleFavoritesOnly);
 
+    let scan_btn = state
+        .core
+        .applet
+        .icon_button("folder-scan-symbolic")
+        .on_press(Message::ScanMusic);
+
+    let sort_icon = match state.sort_mode {
+        SortMode::NameAsc => "sort-alpha-asc-symbolic",
+        SortMode::NameDesc => "sort-alpha-desc-symbolic",
+        SortMode::PlayCountAsc => "sort-numeric-asc-symbolic",
+        SortMode::PlayCountDesc => "sort-numeric-desc-symbolic",
+    };
+    let sort_btn = state
+        .core
+        .applet
+        .icon_button(sort_icon)
+        .on_press(Message::ToggleSortMode);
+
+    let view_icon = match state.view_mode {
+        ViewMode::Albums => "view-list-symbolic",
+        ViewMode::Tracks => "view-stream-symbolic",
+    };
+    let view_btn = state
+        .core
+        .applet
+        .icon_button(view_icon)
+        .on_press(Message::ToggleViewMode);
+
     let header_row = cosmic::widget::Row::new()
         .push(search_input)
         .push(favorites_btn)
+        .push(scan_btn)
+        .push(sort_btn)
+        .push(view_btn)
         .spacing(8)
         .padding(8);
 
@@ -748,6 +843,12 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
             .push(header_row)
             .push(track_listing_view(state, album))
             .into()
+     } else if state.view_mode == ViewMode::Tracks {
+        cosmic::widget::Column::new()
+            .push(media_controls)
+            .push(header_row)
+            .push(tracks_view(state))
+            .into()
     } else {
         cosmic::widget::Column::new()
             .push(media_controls)
@@ -756,7 +857,7 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
             .into()
     };
 
-    Element::from(content)
+    Element::from(cosmic::widget::scrollable(content).width(cosmic::iced::Length::Fill))
 }
 
 fn albums_view(state: &MediaApplet) -> Element<'_, Message> {
@@ -840,11 +941,79 @@ fn track_listing_view<'a>(state: &'a MediaApplet, album: &'a str) -> Element<'a,
     }
 
     if rows.is_empty() {
-        rows.push(cosmic::widget::text("No tracks in this album").size(12).into());
+        rows.push(cosmic::widget::text("No tracks found").size(12).into());
     }
 
     let mut col = cosmic::widget::Column::new()
         .push(cosmic::widget::Row::new().push(back_btn).push(cosmic::widget::text(album).size(14)))
+        .spacing(4);
+    for row in rows {
+        col = col.push(row);
+    }
+    Element::from(col)
+}
+
+fn tracks_view(state: &MediaApplet) -> Element<'_, Message> {
+    if state.tracks.is_empty() {
+        return Element::from(
+            cosmic::widget::Column::new()
+                .push(cosmic::widget::text("No tracks found. Switch to Albums view or scan your music folder.").size(12))
+                .padding(16),
+        );
+    }
+
+    let sort_label = match state.sort_mode {
+        SortMode::NameAsc => "Name A-Z",
+        SortMode::NameDesc => "Name Z-A",
+        SortMode::PlayCountAsc => "Play count asc",
+        SortMode::PlayCountDesc => "Play count desc",
+    };
+
+    let mut rows: Vec<Element<'_, Message>> = Vec::new();
+    for track in &state.tracks {
+        let is_current = state.current_track_info.as_ref()
+            .map(|t| {
+                t.file_path.as_deref() == Some(&track.path)
+            })
+            .unwrap_or(false);
+
+        let fav_icon = if track.is_favorite {
+            "starred-symbolic"
+        } else {
+            "star-symbolic"
+        };
+        let fav_btn = state
+            .core
+            .applet
+            .icon_button(fav_icon)
+            .on_press(Message::ToggleFavorite(track.path.clone()));
+        let play_btn = state
+            .core
+            .applet
+            .icon_button("media-playback-start-symbolic")
+            .on_press(Message::PlayTrack(track.path.clone()));
+        let duration = MediaApplet::format_time(track.duration_ms);
+
+        rows.push(
+            cosmic::widget::Row::new()
+                .push(play_btn)
+                .push(fav_btn)
+                .push(cosmic::widget::text(&track.title))
+                .push(cosmic::widget::text(format!(" — {} (plays: {})", track.artist, track.play_count)))
+                .push(cosmic::widget::text(duration))
+                .push(cosmic::widget::text(if is_current { " ▶" } else { "" }))
+                .spacing(8)
+                .into()
+        );
+    }
+
+    let mut col = cosmic::widget::Column::new()
+        .push(
+            cosmic::widget::Row::new()
+                .push(cosmic::widget::text("All Tracks").size(14))
+                .push(cosmic::widget::text(format!("  (sorted by {})", sort_label)).size(11))
+                .spacing(4)
+        )
         .spacing(4);
     for row in rows {
         col = col.push(row);
