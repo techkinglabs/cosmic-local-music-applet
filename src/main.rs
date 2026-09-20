@@ -1,11 +1,14 @@
 use cosmic::applet;
 use cosmic::iced::advanced::subscription::from_recipe;
+use cosmic::iced::core::window as iced_core_window;
 use cosmic::prelude::*;
+use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic_media_applet::manager::MediaSourceManager;
 use cosmic_media_applet::message::AppMessage;
 use cosmic_media_applet::mpris::{MediaEvent, PlaybackState, TrackInfo};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing_subscriber::EnvFilter;
@@ -16,6 +19,10 @@ pub struct MediaApplet {
     current_track: String,
     current_track_info: Option<TrackInfo>,
     current_state: PlaybackState,
+    popup_id: Option<iced_core_window::Id>,
+    stats_album_count: usize,
+    stats_track_count: usize,
+    stats_last_scanned: u64,
 }
 
 #[derive(Clone)]
@@ -23,12 +30,16 @@ pub enum Message {
     Previous,
     PlayPause,
     Next,
+    ScanMusic,
+    UpdateStats { album_count: usize, track_count: usize, last_scanned: u64 },
     MediaEvent(MediaEvent),
     ManagerReady(Arc<MediaSourceManager>),
     UpdateState {
         track: Option<TrackInfo>,
         state: PlaybackState,
     },
+    PopupClosed(iced_core_window::Id),
+    Surface(cosmic::surface::Action<Message>),
 }
 
 impl MediaApplet {
@@ -49,6 +60,34 @@ impl MediaApplet {
         };
         tracing::debug!(state = ?self.current_state, "Updated playback display");
     }
+
+    fn max_title_chars(&self) -> usize {
+        const CHAR_PX: f32 = 7.0;
+        let bounds_width = self
+            .core
+            .applet
+            .suggested_bounds
+            .as_ref()
+            .filter(|bounds| bounds.width > 0.0)
+            .map(|bounds| bounds.width)
+            .unwrap_or(0.0);
+
+        if bounds_width <= 0.0 {
+            return usize::MAX;
+        }
+
+        let (icon, _) = self.core.applet.suggested_size(true);
+        let button_width = icon as f32 * 1.5 + 8.0;
+        let reserved = button_width * 4.0 + 4.0 * 6.0 + 2.0 * 8.0;
+        let available = bounds_width - reserved;
+
+        if available <= 0.0 {
+            return 3;
+        }
+
+        let chars = (available / CHAR_PX) as usize;
+        chars.clamp(3, 128)
+    }
 }
 
 impl std::fmt::Debug for Message {
@@ -57,8 +96,23 @@ impl std::fmt::Debug for Message {
             Message::Previous => f.debug_struct("Previous").finish(),
             Message::PlayPause => f.debug_struct("PlayPause").finish(),
             Message::Next => f.debug_struct("Next").finish(),
+            Message::ScanMusic => f.debug_struct("ScanMusic").finish(),
+            Message::UpdateStats { album_count, track_count, last_scanned } => f
+                .debug_struct("UpdateStats")
+                .field("album_count", album_count)
+                .field("track_count", track_count)
+                .field("last_scanned", last_scanned)
+                .finish(),
             Message::MediaEvent(e) => f.debug_struct("MediaEvent").field("event", e).finish(),
             Message::ManagerReady(_) => f.debug_struct("ManagerReady").finish(),
+            Message::PopupClosed(id) => f
+                .debug_struct("PopupClosed")
+                .field("id", id)
+                .finish(),
+            Message::Surface(a) => f
+                .debug_struct("Surface")
+                .field("action", &format_args!("{:?}", a))
+                .finish(),
             Message::UpdateState { track, state } => f
                 .debug_struct("UpdateState")
                 .field("track", track)
@@ -114,6 +168,14 @@ impl cosmic::Application for MediaApplet {
         &mut self.core
     }
 
+    fn on_close_requested(&self, id: iced_core_window::Id) -> Option<Self::Message> {
+        if self.popup_id.as_ref() == Some(&id) {
+            Some(Message::PopupClosed(id))
+        } else {
+            None
+        }
+    }
+
     fn init(core: cosmic::Core, _flags: Self::Flags) -> (Self, cosmic::app::Task<Self::Message>) {
         (
             Self {
@@ -122,6 +184,10 @@ impl cosmic::Application for MediaApplet {
                 current_track: "No media".to_string(),
                 current_track_info: None,
                 current_state: PlaybackState::Stopped,
+                popup_id: None,
+                stats_album_count: 0,
+                stats_track_count: 0,
+                stats_last_scanned: 0,
             },
             cosmic::app::Task::perform(
                 async {
@@ -203,12 +269,36 @@ impl cosmic::Application for MediaApplet {
                     );
                 }
             }
+            Message::ScanMusic => {
+                if let Some(ref manager) = self.manager {
+                    tracing::info!("ScanMusic requested");
+                    let m = manager.clone();
+                    return cosmic::app::Task::perform(
+                        async move { m.route(AppMessage::ScanMusic).await },
+                        |result| match result {
+                            Ok(_) => {
+                                tracing::info!("ScanMusic completed");
+                                cosmic::Action::None
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ScanMusic failed");
+                                cosmic::Action::None
+                            }
+                        },
+                    );
+                }
+            }
             Message::ManagerReady(manager) => {
                 self.manager = Some(manager.clone());
                 tracing::info!("MediaSourceManager ready; reading initial track and state");
                 let (track, state) = manager.cached_state();
                 tracing::debug!(?track, ?state, "Using cached initial media state");
                 self.apply_track_state(track, state);
+                let (albums, count, ts) = manager.cached_stats();
+                tracing::debug!(albums, count, ts, "Using cached initial stats");
+                self.stats_album_count = albums;
+                self.stats_track_count = count;
+                self.stats_last_scanned = ts;
             }
             Message::MediaEvent(event) => {
                 tracing::debug!(?event, "Received media event");
@@ -233,11 +323,31 @@ impl cosmic::Application for MediaApplet {
                         };
                         self.apply_track_state(track, state);
                     }
+                    MediaEvent::StatsUpdated { track_count, album_count, last_scanned } => {
+                        tracing::debug!(track_count, album_count, last_scanned, "Stats updated from broadcast");
+                        self.stats_album_count = album_count;
+                        self.stats_track_count = track_count;
+                        self.stats_last_scanned = last_scanned;
+                    }
                 }
+            }
+            Message::UpdateStats { album_count, track_count, last_scanned } => {
+                tracing::debug!(album_count, track_count, last_scanned, "UpdateStats message received");
+                self.stats_album_count = album_count;
+                self.stats_track_count = track_count;
+                self.stats_last_scanned = last_scanned;
             }
             Message::UpdateState { track, state } => {
                 tracing::debug!(?track, ?state, "Applied initial media state");
                 self.apply_track_state(track, state);
+            }
+            Message::PopupClosed(id) => {
+                if self.popup_id.as_ref() == Some(&id) {
+                    self.popup_id = None;
+                }
+            }
+            Message::Surface(action) => {
+                return cosmic::task::message(cosmic::Action::Surface(action));
             }
         }
         cosmic::app::Task::none()
@@ -264,13 +374,83 @@ impl cosmic::Application for MediaApplet {
             .icon_button("media-skip-forward-symbolic")
             .on_press(Message::Next);
 
-        let title = cosmic::widget::text(&self.current_track)
+        let have_popup = self.popup_id;
+        let popup_btn = self
+            .core
+            .applet
+            .icon_button("open-menu-symbolic")
+            .on_press_with_rectangle(move |offset, bounds| {
+                if let Some(id) = have_popup {
+                    Message::Surface(destroy_popup(id))
+                } else {
+                    Message::Surface(app_popup::<MediaApplet>(
+                        |_| cosmic::surface::action::LiveSettings::default(),
+                        move |state: &mut MediaApplet| {
+                            let new_id = iced_core_window::Id::unique();
+                            state.popup_id = Some(new_id);
+                            let mut popup_settings = state
+                                .core
+                                .applet
+                                .get_popup_settings(
+                                    state.core.main_window_id().unwrap(),
+                                    new_id,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                            popup_settings.positioner.anchor_rect =
+                                cosmic::iced::Rectangle {
+                                    x: (bounds.x - offset.x) as i32,
+                                    y: (bounds.y - offset.y) as i32,
+                                    width: bounds.width as i32,
+                                    height: bounds.height as i32,
+                                };
+                            popup_settings
+                        },
+                        Some(Box::new(move |state: &MediaApplet| {
+                            let stats_text = match state.stats_last_scanned {
+                                0 => format!("Albums: {}  Tracks: {}", state.stats_album_count, state.stats_track_count),
+                                ts => {
+                                    let days_ago = (SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        - ts)
+                                        / 86400;
+                                    let time_str = if days_ago == 0 { "today".to_string() } else { format!("{}d ago", days_ago) };
+                                    format!("Albums: {}  Tracks: {} ({})", state.stats_album_count, state.stats_track_count, time_str)
+                                }
+                            };
+                            let scan_btn = state
+                                .core
+                                .applet
+                                .icon_button("view-refresh-symbolic")
+                                .on_press(Message::ScanMusic);
+                            let content = cosmic::widget::Row::new()
+                                .push(cosmic::widget::text(stats_text))
+                                .push(cosmic::widget::Column::new().width(cosmic::iced::Length::Fill).height(0))
+                                .push(scan_btn)
+                                .spacing(8)
+                                .padding(8);
+                            Element::from(state.core.applet.popup_container(content))
+                                .map(cosmic::Action::App)
+                        })),
+                    ))
+                }
+            });
+
+        let title_text = {
+            let max_chars = self.max_title_chars();
+            self.current_track.chars().take(max_chars).collect::<String>()
+        };
+        let title = cosmic::widget::text(title_text)
             .size(14)
             .ellipsize(cosmic::iced::core::text::Ellipsize::End(
                 cosmic::iced::core::text::EllipsizeHeightLimit::Lines(1),
             ));
 
         let row = cosmic::widget::Row::new()
+            .push(popup_btn)
             .push(previous_btn)
             .push(play_pause_btn)
             .push(next_btn)

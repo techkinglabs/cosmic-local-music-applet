@@ -5,6 +5,7 @@
 
 pub use self::message::AppMessage;
 pub use self::mpris::{MediaEvent, MediaSource, MprisAdapter, PlaybackState, TrackInfo};
+pub use self::music_db::MusicStats;
 
 /// Media source trait for controlling playback.
 pub mod error;
@@ -14,3 +15,5 @@ pub mod manager;
 pub mod message;
 /// MPRIS adapter for D-Bus communication.
 pub mod mpris;
+/// SQLite-backed music stats database.
+pub mod music_db;

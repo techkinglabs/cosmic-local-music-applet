@@ -11,6 +11,9 @@ pub enum AppError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Scan error: {0}")]
+    Scan(String),
 }
 
 impl AppError {

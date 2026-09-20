@@ -54,6 +54,15 @@ pub enum MediaEvent {
     StateChanged(PlaybackState),
     /// List of available sources changed
     SourceListChanged,
+    /// Music folder stats updated
+    StatsUpdated {
+        /// Number of tracks found
+        track_count: usize,
+        /// Number of albums (directories) found
+        album_count: usize,
+        /// Unix timestamp of last scan
+        last_scanned: u64,
+    },
 }
 
 /// Trait for media sources that can be controlled via MPRIS2.

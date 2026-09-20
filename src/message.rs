@@ -7,4 +7,6 @@ pub enum AppMessage {
     PlayPause,
     /// Skip to next track
     Next,
+    /// Scan music folder and update stats
+    ScanMusic,
 }

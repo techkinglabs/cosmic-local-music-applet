@@ -1,8 +1,10 @@
 use crate::error::AppError;
 use crate::message::AppMessage;
 use crate::mpris::{MediaEvent, MediaSource, PlaybackState, TrackInfo};
+use crate::music_db::MusicStatsDb;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::timeout;
 use zbus::{Connection, Proxy};
@@ -22,6 +24,10 @@ pub struct MediaSourceManager {
     _watch_handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
     cached_track: Arc<RwLock<Option<TrackInfo>>>,
     cached_state: Arc<RwLock<PlaybackState>>,
+    db_path: Option<PathBuf>,
+    stats_album_count: Arc<RwLock<usize>>,
+    stats_track_count: Arc<RwLock<usize>>,
+    stats_last_scanned: Arc<RwLock<u64>>,
 }
 
 impl MediaSourceManager {
@@ -36,6 +42,10 @@ impl MediaSourceManager {
             _watch_handles: Arc::new(RwLock::new(Vec::new())),
             cached_track: Arc::new(RwLock::new(None)),
             cached_state: Arc::new(RwLock::new(PlaybackState::Stopped)),
+            db_path: None,
+            stats_album_count: Arc::new(RwLock::new(0)),
+            stats_track_count: Arc::new(RwLock::new(0)),
+            stats_last_scanned: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -122,6 +132,19 @@ impl MediaSourceManager {
             }
         });
 
+        let db_path = MusicStatsDb::db_path();
+        let (initial_count, initial_albums, initial_ts) = tokio::task::spawn_blocking(move || {
+            MusicStatsDb::new()
+                .map(|db| db.get_stats())
+                .unwrap_or((0, 0, 0))
+        })
+        .await
+        .unwrap_or((0, 0, 0));
+
+        let stats_album_count: Arc<RwLock<usize>> = Arc::new(RwLock::new(initial_albums));
+        let stats_track_count: Arc<RwLock<usize>> = Arc::new(RwLock::new(initial_count));
+        let stats_last_scanned: Arc<RwLock<u64>> = Arc::new(RwLock::new(initial_ts));
+
         Ok(Self {
             connection: Some(connection),
             sources,
@@ -131,6 +154,10 @@ impl MediaSourceManager {
             _watch_handles: watch_handles,
             cached_track,
             cached_state,
+            db_path: Some(db_path),
+            stats_album_count,
+            stats_track_count,
+            stats_last_scanned,
         })
     }
 
@@ -263,7 +290,8 @@ impl MediaSourceManager {
                                     )
                                     .await;
                                 }
-                                MediaEvent::SourceListChanged => {}
+                                MediaEvent::SourceListChanged => {},
+                                MediaEvent::StatsUpdated { .. } => {},
                             }
                             let _ = sender_clone.send(event);
                         }
@@ -421,23 +449,105 @@ impl MediaSourceManager {
     }
 
     pub async fn route(&self, cmd: AppMessage) -> anyhow::Result<()> {
-        let active = self.active_source.read().await.clone();
-        let source = active.ok_or_else(|| AppError::NoActiveSource)?;
-        tracing::info!(source = %source.display_name(), command = ?cmd, "Routing media command");
-        let result = match cmd {
-            AppMessage::Previous => source.previous().await,
-            AppMessage::PlayPause => source.play_pause().await,
-            AppMessage::Next => source.next().await,
-        };
-        match &result {
-            Ok(()) => {
-                tracing::debug!(source = %source.display_name(), command = ?cmd, "Media command accepted")
+        match cmd {
+            AppMessage::ScanMusic => {
+                tracing::info!("ScanMusic requested");
+                self.scan_music().await
             }
-            Err(e) => {
-                tracing::warn!(source = %source.display_name(), command = ?cmd, error = %e, "Media command rejected")
+            AppMessage::Previous => {
+                let active = self.active_source.read().await.clone();
+                let source = active.ok_or_else(|| AppError::NoActiveSource)?;
+                tracing::info!(source = %source.display_name(), command = ?cmd, "Routing media command");
+                let result = source.previous().await;
+                self.log_command_result(&result, &source, &cmd);
+                result
+            }
+            AppMessage::PlayPause => {
+                let active = self.active_source.read().await.clone();
+                let source = active.ok_or_else(|| AppError::NoActiveSource)?;
+                tracing::info!(source = %source.display_name(), command = ?cmd, "Routing media command");
+                let result = source.play_pause().await;
+                self.log_command_result(&result, &source, &cmd);
+                result
+            }
+            AppMessage::Next => {
+                let active = self.active_source.read().await.clone();
+                let source = active.ok_or_else(|| AppError::NoActiveSource)?;
+                tracing::info!(source = %source.display_name(), command = ?cmd, "Routing media command");
+                let result = source.next().await;
+                self.log_command_result(&result, &source, &cmd);
+                result
             }
         }
-        result
+    }
+
+    fn log_command_result(&self, result: &anyhow::Result<()>, source: &Arc<dyn MediaSource>, cmd: &AppMessage) {
+        match result {
+            Ok(()) => tracing::debug!(source = %source.display_name(), command = ?cmd, "Media command accepted"),
+            Err(e) => tracing::warn!(source = %source.display_name(), command = ?cmd, error = %e, "Media command rejected"),
+        }
+    }
+
+    pub async fn scan_music(&self) -> anyhow::Result<()> {
+        tracing::info!("Starting music folder scan");
+        let music_dir = MusicStatsDb::music_folder();
+        let _db_path = self
+            .db_path
+            .clone()
+            .ok_or_else(|| AppError::Scan("Database not initialized".to_string()))?;
+
+        let (track_count, album_count) = tokio::task::spawn_blocking(move || {
+            MusicStatsDb::scan_music_folder(music_dir.as_path())
+        })
+        .await
+        .map_err(|e| AppError::Scan(format!("scan task failed: {e}")))?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        *self.stats_album_count.write().await = album_count;
+        *self.stats_track_count.write().await = track_count;
+        *self.stats_last_scanned.write().await = timestamp;
+
+        tokio::task::spawn_blocking(move || {
+            MusicStatsDb::new()
+                .and_then(|db| db.set_stats(track_count, album_count, timestamp))
+        })
+        .await
+        .map_err(|e| AppError::Scan(format!("set_stats task failed: {e}")))??;
+
+        let _ = self.event_sender.send(MediaEvent::StatsUpdated {
+            track_count,
+            album_count,
+            last_scanned: timestamp,
+        });
+        tracing::info!(track_count, album_count, last_scanned = timestamp, "Music scan complete");
+        Ok(())
+    }
+
+    pub async fn get_stats(&self) -> (usize, usize, u64) {
+        let albums = *self.stats_album_count.read().await;
+        let count = *self.stats_track_count.read().await;
+        let ts = *self.stats_last_scanned.read().await;
+        (albums, count, ts)
+    }
+
+    pub fn cached_stats(&self) -> (usize, usize, u64) {
+        let albums = match self.stats_album_count.try_read() {
+            Ok(g) => *g,
+            Err(_) => 0,
+        };
+        let count = match self.stats_track_count.try_read() {
+            Ok(g) => *g,
+            Err(_) => 0,
+        };
+        let ts = match self.stats_last_scanned.try_read() {
+            Ok(g) => *g,
+            Err(_) => 0,
+        };
+        (albums, count, ts)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MediaEvent> {
