@@ -81,7 +81,10 @@ pub enum Message {
     LoadAlbums,
     LoadTracks,
     UpdateAlbums(Vec<AlbumInfo>),
-    UpdateTracks(Vec<TrackStat>),
+    UpdateTracks {
+        tracks: Vec<TrackStat>,
+        set_playlist: bool,
+    },
     DeleteTrack(String),
     ConfirmDelete(Option<String>),
     CancelDelete,
@@ -237,9 +240,13 @@ impl std::fmt::Debug for Message {
                 .debug_struct("UpdateAlbums")
                 .field("count", &albums.len())
                 .finish(),
-            Message::UpdateTracks(tracks) => f
+            Message::UpdateTracks {
+                tracks,
+                set_playlist,
+            } => f
                 .debug_struct("UpdateTracks")
                 .field("count", &tracks.len())
+                .field("set_playlist", &set_playlist)
                 .finish(),
             Message::DeleteTrack(path) => f
                 .debug_struct("DeleteTrack")
@@ -431,7 +438,10 @@ impl cosmic::Application for MediaApplet {
                         |result| match result {
                             Ok(tracks) => {
                                 let t = tracks;
-                                cosmic::Action::App(Message::UpdateTracks(t))
+                                cosmic::Action::App(Message::UpdateTracks {
+                                    tracks: t,
+                                    set_playlist: false,
+                                })
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "Search failed");
@@ -454,7 +464,10 @@ impl cosmic::Application for MediaApplet {
                             }
                         },
                         |result| match result {
-                            Ok(tracks) => cosmic::Action::App(Message::UpdateTracks(tracks)),
+                            Ok(tracks) => cosmic::Action::App(Message::UpdateTracks {
+                                tracks,
+                                set_playlist: true,
+                            }),
                             Err(e) => {
                                 tracing::warn!(error = %e, "Failed to load album tracks");
                                 cosmic::Action::None
@@ -522,7 +535,10 @@ impl cosmic::Application for MediaApplet {
                     return cosmic::app::Task::perform(
                         async move { m.all_tracks_sorted(sort_mode).await },
                         |result| match result {
-                            Ok(tracks) => cosmic::Action::App(Message::UpdateTracks(tracks)),
+                            Ok(tracks) => cosmic::Action::App(Message::UpdateTracks {
+                                tracks,
+                                set_playlist: true,
+                            }),
                             Err(e) => {
                                 tracing::warn!(error = %e, "Failed to load tracks");
                                 cosmic::Action::None
@@ -636,6 +652,9 @@ impl cosmic::Application for MediaApplet {
                     MediaEvent::VolumeChanged(vol) => {
                         self.current_volume = vol;
                     }
+                    MediaEvent::TrackFinished => {
+                        tracing::debug!("TrackFinished event received");
+                    }
                 }
                 cosmic::app::Task::none()
             }
@@ -659,9 +678,12 @@ impl cosmic::Application for MediaApplet {
                 self.albums = albums;
                 cosmic::app::Task::none()
             }
-            Message::UpdateTracks(tracks) => {
+            Message::UpdateTracks {
+                tracks,
+                set_playlist,
+            } => {
                 self.tracks = tracks.clone();
-                if !tracks.is_empty() {
+                if set_playlist && !tracks.is_empty() {
                     let task = cosmic::app::Task::done(cosmic::Action::App(
                         Message::SetPlaylist(tracks),
                     ));
@@ -979,15 +1001,13 @@ fn media_player_view(state: &MediaApplet) -> Element<'_, Message> {
                             state
                                 .core
                                 .applet
-                                .icon_button("dialog-ok-symbolic")
-                                .on_press(Message::ConfirmDelete(Some(path_to_delete.clone()))),
+                                .text_button("Yes", Message::ConfirmDelete(Some(path_to_delete.clone())))
                         )
                         .push(
                             state
                                 .core
                                 .applet
-                                .icon_button("dialog-cancel-symbolic")
-                                .on_press(Message::CancelDelete),
+                                .text_button("No", Message::CancelDelete),
                         )
                         .spacing(12),
                 )

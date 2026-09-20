@@ -103,6 +103,8 @@ pub enum MediaEvent {
     },
     /// Volume changed (0.0 to 1.0)
     VolumeChanged(f32),
+    /// Track reached its natural end (not an explicit user Stop)
+    TrackFinished,
 }
 
 /// Trait for media sources that can be controlled via MPRIS2 or local playback.

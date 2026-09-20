@@ -126,6 +126,14 @@ impl MediaSourceManager {
                                 MediaEvent::VolumeChanged(_) => {},
                                 MediaEvent::StatsUpdated { .. } => {},
                                 MediaEvent::SourceListChanged => {},
+                                MediaEvent::TrackFinished => {
+                                    let player = player.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = player.next().await {
+                                            tracing::warn!(error = %e, "Failed to auto-advance to next track");
+                                        }
+                                    });
+                                }
                             }
                             let _ = sender_clone.send(event);
                         }
@@ -260,10 +268,24 @@ impl MediaSourceManager {
 
         {
             let mut sources_guard = sources_lock.write().await;
+
+            // Bus-name-derived ids of players that are currently live on the bus.
+            let live_ids: std::collections::HashSet<String> = names
+                .iter()
+                .map(|n| n.strip_prefix(MPRIS_PREFIX).unwrap_or(n).to_string())
+                .collect();
+
+            // Drop any MPRIS source whose player is no longer present.
+            // Never drop the local player — it's not part of `names` at all.
+            sources_guard.retain(|s| {
+                s.id() == crate::player::LOCAL_PLAYER_ID || live_ids.contains(s.id())
+            });
+
             let existing_ids: std::collections::HashSet<String> =
                 sources_guard.iter().map(|s| s.id().to_string()).collect();
             for bus_name in &names {
-                if !existing_ids.contains(&format!("mpris:{}", bus_name)) {
+                let candidate_id = bus_name.strip_prefix(MPRIS_PREFIX).unwrap_or(bus_name);
+                if !existing_ids.contains(candidate_id) {
                     match MprisAdapter::new(bus_name.clone(), conn.clone()).await {
                         Ok(adapter) => {
                             tracing::info!(bus_name = %bus_name, display_name = %adapter.display_name(), "Created MPRIS adapter");
@@ -390,6 +412,7 @@ impl MediaSourceManager {
                                 MediaEvent::StatsUpdated { .. } => {},
                                 MediaEvent::PlaybackPosition { .. } => {},
                                 MediaEvent::VolumeChanged(_) => {},
+                                MediaEvent::TrackFinished => {},
                             }
                             let _ = sender_clone.send(event);
                         }
